@@ -12,10 +12,13 @@ import static ludo.binge.LudoBingeServer.shared.Store.*;
 public class IdentityService {
  public record Actor(UUID userId,UUID sessionId) implements java.security.Principal { public String getName(){return userId.toString();} }
  private final Store db;
- private final String clientId;
+ private final java.util.Set<String> clientIds;
  private volatile JwtDecoder google;
- public IdentityService(Store db,@Value("${ludo.google.client-id:}") String clientId) {this.db=db;this.clientId=clientId;}
- public boolean configured(){return !clientId.isBlank();}
+ public IdentityService(Store db,@Value("${ludo.google.client-id:}") String clientId) {
+  this.db=db;
+  this.clientIds=Arrays.stream(clientId.split(",")).map(String::trim).filter(s -> !s.isEmpty()).collect(java.util.stream.Collectors.toSet());
+ }
+ public boolean configured(){return !clientIds.isEmpty();}
  public Object challenge(String remote) {
   db.limit("auth:"+remote,20,60); String nonce=token();UUID id=id();
   db.update("INSERT INTO auth_challenges(id,nonce_hash,expires_at) VALUES (?,?,now()+interval '5 minutes')",id,hash(nonce));
@@ -26,7 +29,7 @@ public class IdentityService {
   if(google==null) synchronized(this) { if(google==null) {
    var decoder=NimbusJwtDecoder.withJwkSetUri("https://www.googleapis.com/oauth2/v3/certs").build();
    decoder.setJwtValidator(new DelegatingOAuth2TokenValidator<>(new JwtTimestampValidator(),jwt -> {
-    boolean valid=jwt.getAudience().contains(clientId) && Set.of("https://accounts.google.com","accounts.google.com").contains(jwt.getClaimAsString("iss"));
+    boolean valid=jwt.getAudience().stream().anyMatch(clientIds::contains) && Set.of("https://accounts.google.com","accounts.google.com").contains(jwt.getClaimAsString("iss"));
     return valid ? OAuth2TokenValidatorResult.success() : OAuth2TokenValidatorResult.failure(new OAuth2Error("invalid_token"));
    }));google=decoder;
   }}
