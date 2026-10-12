@@ -9,7 +9,8 @@ import org.springframework.http.converter.HttpMessageNotReadableException;
 public class Errors {
  @ExceptionHandler(org.springframework.dao.DataAccessException.class) ResponseEntity<?> unavailable(Exception e) {
   org.slf4j.LoggerFactory.getLogger(Errors.class).error("Database request failed", e);
-  return ResponseEntity.status(503).body(Map.of("code","SERVICE_UNAVAILABLE","retryable",true));
+  String detail = e.getCause() != null ? e.getCause().getMessage() : e.getMessage();
+  return ResponseEntity.status(503).body(Map.of("code","SERVICE_UNAVAILABLE","retryable",true,"detail",detail != null ? detail : "unknown"));
  }
  @ExceptionHandler(ApiError.class) ResponseEntity<?> domain(ApiError e) { return ResponseEntity.status(e.status).body(Map.of("code",e.code,"retryable",e.status==503||e.status==429)); }
  @ExceptionHandler(DataIntegrityViolationException.class) ResponseEntity<?> conflict(Exception e) { return ResponseEntity.status(409).body(Map.of("code","CONFLICT","retryable",false)); }
