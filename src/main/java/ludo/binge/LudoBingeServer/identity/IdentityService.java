@@ -45,11 +45,10 @@ public class IdentityService {
   });
  }
  public Object guest(String name,String remote) {
-  db.limit("guest:"+remote,10,3600);
-  String display=name.strip();require(!display.isEmpty()&&display.length()<=40,400,"INVALID_NAME");
-  return db.tx(()->{UUID user=id();db.update("INSERT INTO users(id,display_name) VALUES (?,?)",user,display);return issue(user,id());});
+  throw new ApiError(403,"GOOGLE_SIGN_IN_REQUIRED");
  }
  private Object issue(UUID user,UUID family) {
+  require(!db.rows("SELECT 1 FROM users WHERE id=? AND google_sub IS NOT NULL AND status='ACTIVE'",user).isEmpty(),403,"GOOGLE_SIGN_IN_REQUIRED");
   String refresh=token(),access=token();UUID sid=id();
   db.update("INSERT INTO refresh_sessions(id,user_id,family,token_hash,access_hash,access_expires,expires_at) VALUES (?,?,?,?,?,now()+interval '15 minutes',now()+interval '30 days')",sid,user,family,hash(refresh),hash(access));
   return Map.of("accessToken",access,"refreshToken",refresh,"tokenType","Bearer","expiresIn",900,"user",profile(user));
@@ -72,10 +71,10 @@ public class IdentityService {
  }
  public Actor authenticate(String access) {
   require(access!=null&&access.length()<=512,401,"AUTHENTICATION_REQUIRED");
-  var rows=db.rows("SELECT s.id,s.user_id FROM refresh_sessions s JOIN users u ON u.id=s.user_id WHERE access_hash=? AND NOT revoked AND access_expires>now() AND u.status='ACTIVE'",hash(access));
+  var rows=db.rows("SELECT s.id,s.user_id FROM refresh_sessions s JOIN users u ON u.id=s.user_id WHERE access_hash=? AND NOT revoked AND access_expires>now() AND u.status='ACTIVE' AND u.google_sub IS NOT NULL",hash(access));
   require(!rows.isEmpty(),401,"AUTHENTICATION_REQUIRED");return new Actor(uuid(rows.getFirst().get("user_id")),uuid(rows.getFirst().get("id")));
  }
- public boolean valid(Actor actor){return !db.rows("SELECT 1 FROM refresh_sessions s JOIN users u ON u.id=s.user_id WHERE s.id=? AND s.user_id=? AND NOT revoked AND access_hash IS NOT NULL AND access_expires>now() AND u.status='ACTIVE'",actor.sessionId(),actor.userId()).isEmpty();}
+ public boolean valid(Actor actor){return !db.rows("SELECT 1 FROM refresh_sessions s JOIN users u ON u.id=s.user_id WHERE s.id=? AND s.user_id=? AND NOT revoked AND access_hash IS NOT NULL AND access_expires>now() AND u.status='ACTIVE' AND u.google_sub IS NOT NULL",actor.sessionId(),actor.userId()).isEmpty();}
  public Object profile(UUID user){return db.one("SELECT id AS \"userId\",display_name AS \"displayName\",avatar_url AS \"avatarUrl\",avatar_version AS \"avatarVersion\" FROM users WHERE id=?",user);}
  public Object logout(Actor actor){db.update("UPDATE refresh_sessions SET revoked=true WHERE family=(SELECT family FROM refresh_sessions WHERE id=?)",actor.sessionId());return Map.of("loggedOut",true);}
 }

@@ -18,6 +18,11 @@ public class SecurityConfiguration {
  @Bean SecurityFilterChain apiSecurity(HttpSecurity http,IdentityService identity)throws Exception {
   var bearer=new OncePerRequestFilter(){
    protected void doFilterInternal(HttpServletRequest request,HttpServletResponse response,FilterChain chain)throws ServletException,IOException {
+    String uri=request.getRequestURI();
+    if(uri.startsWith("/api/v1/auth/")||uri.equals("/api/v1/capabilities")||uri.equals("/api/v1/config")||uri.startsWith("/actuator/")||uri.equals("/error")||uri.startsWith("/r/")){
+     chain.doFilter(request,response);
+     return;
+    }
     String header=request.getHeader("Authorization");
     if(header!=null){
      try{ApiError.require(header.startsWith("Bearer "),401,"AUTHENTICATION_REQUIRED");var actor=identity.authenticate(header.substring(7));SecurityContextHolder.getContext().setAuthentication(new UsernamePasswordAuthenticationToken(actor,null,List.of()));}
@@ -30,7 +35,7 @@ public class SecurityConfiguration {
    .addFilterBefore(bearer,UsernamePasswordAuthenticationFilter.class)
    .authorizeHttpRequests(a->a
     .requestMatchers(org.springframework.http.HttpMethod.GET,"/api/v1/capabilities","/api/v1/config","/actuator/health","/actuator/health/**","/r/**").permitAll()
-    .requestMatchers(org.springframework.http.HttpMethod.POST,"/api/v1/auth/guest","/api/v1/auth/challenge","/api/v1/auth/google","/api/v1/auth/refresh").permitAll()
+    .requestMatchers("/api/v1/auth/**","/error").permitAll()
     .requestMatchers("/api/v1/**","/ws").authenticated().anyRequest().denyAll())
    .exceptionHandling(e->e.authenticationEntryPoint((req,res,error)->{res.setStatus(401);res.setContentType("application/json");res.getWriter().write("{\"code\":\"AUTHENTICATION_REQUIRED\"}");}))
    .build();

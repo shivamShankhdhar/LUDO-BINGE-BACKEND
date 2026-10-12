@@ -24,6 +24,22 @@ class LudoBingeServerApplicationTests {
   var response=get("/api/v1/capabilities");
   assertEquals(200,response.statusCode());
   assertTrue(response.body().contains("\"onlinePlayEnabled\":true"));
+  assertTrue(response.body().contains("\"guestSignInEnabled\":false"));
+ }
+ @Test void challengeIsPublicEvenWhenDatabaseIsUnavailable() throws Exception {
+  var request=HttpRequest.newBuilder(URI.create("http://localhost:"+port+"/api/v1/auth/challenge"))
+   .header("Content-Type","application/json").POST(HttpRequest.BodyPublishers.ofString("{}")).build();
+  var response=HttpClient.newHttpClient().send(request,HttpResponse.BodyHandlers.ofString());
+  assertEquals(503,response.statusCode());
+  assertTrue(response.body().contains("SERVICE_UNAVAILABLE"));
+ }
+ @Test void rejectsGuestSignIn() throws Exception {
+  var request=HttpRequest.newBuilder(URI.create("http://localhost:"+port+"/api/v1/auth/guest"))
+   .header("Content-Type","application/json")
+   .POST(HttpRequest.BodyPublishers.ofString("{\"displayName\":\"Guest\"}")).build();
+  var response=HttpClient.newHttpClient().send(request,HttpResponse.BodyHandlers.ofString());
+  assertEquals(403,response.statusCode());
+  assertTrue(response.body().contains("GOOGLE_SIGN_IN_REQUIRED"));
  }
  @Test void deniesPrivateRoutesWithoutSession() throws Exception {
   var response=get("/api/v1/profile");

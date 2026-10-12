@@ -8,5 +8,5 @@ import org.springframework.web.bind.annotation.*;
 public class CapabilitiesController {
  private final IdentityService identity;
  public CapabilitiesController(IdentityService identity){this.identity=identity;}
- @GetMapping({"/api/v1/capabilities","/api/v1/config"}) public Object capabilities(){return Map.of("protocolVersion",1,"status","ONLINE","onlinePlayEnabled",true,"guestSignInEnabled",true,"googleSignInEnabled",identity.configured(),"voiceEnabled",false,"plannedMatchConfigurations",IntStream.rangeClosed(2,6).mapToObj(MatchConfiguration::forPlayers).toList());}
+ @GetMapping({"/api/v1/capabilities","/api/v1/config"}) public Object capabilities(){return Map.of("protocolVersion",1,"status","ONLINE","onlinePlayEnabled",true,"guestSignInEnabled",false,"googleSignInEnabled",identity.configured(),"voiceEnabled",false,"plannedMatchConfigurations",IntStream.rangeClosed(2,6).mapToObj(MatchConfiguration::forPlayers).toList());}
 }
