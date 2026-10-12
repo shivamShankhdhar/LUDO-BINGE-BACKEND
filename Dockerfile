@@ -34,5 +34,5 @@ USER spring:spring
 ENV PORT=8080
 EXPOSE 8080
 
-ENTRYPOINT ["docker-entrypoint.sh"]
-CMD ["java", "-XX:+UseContainerSupport", "-XX:MaxRAMPercentage=75.0", "-jar", "app.jar"]
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
+CMD ["java", "-XX:+UseContainerSupport", "-XX:MaxRAMPercentage=75.0", "-XX:+ExitOnOutOfMemoryError", "-jar", "app.jar"]
