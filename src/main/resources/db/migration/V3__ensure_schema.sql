@@ -1,3 +1,12 @@
+DO $$
+BEGIN
+  IF EXISTS (
+    SELECT 1 FROM information_schema.columns 
+    WHERE table_name = 'users' AND column_name = 'id' AND udt_name <> 'uuid'
+  ) THEN
+    DROP TABLE users CASCADE;
+  END IF;
+END $$;
 CREATE TABLE IF NOT EXISTS users (
  id uuid PRIMARY KEY, google_sub text UNIQUE, display_name varchar(80) NOT NULL,
  avatar_url text, avatar_version bigint NOT NULL DEFAULT 1,
