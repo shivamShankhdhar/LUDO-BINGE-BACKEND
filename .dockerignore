@@ -1,0 +1,10 @@
+target/
+.git/
+.gitignore
+.idea/
+*.iml
+.DS_Store
+.env
+.env.*
+config/database-local.properties
+HELP.md
