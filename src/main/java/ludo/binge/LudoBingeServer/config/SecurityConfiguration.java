@@ -24,8 +24,14 @@ public class SecurityConfiguration {
      return;
     }
     String header=request.getHeader("Authorization");
-    if(header!=null){
-     try{ApiError.require(header.startsWith("Bearer "),401,"AUTHENTICATION_REQUIRED");var actor=identity.authenticate(header.substring(7));SecurityContextHolder.getContext().setAuthentication(new UsernamePasswordAuthenticationToken(actor,null,List.of()));}
+    String token=null;
+    if(header!=null && header.startsWith("Bearer ")){
+     token=header.substring(7);
+    } else if(uri.startsWith("/ws")){
+     token=request.getParameter("token");
+    }
+    if(token!=null){
+     try{ApiError.require(token.length()<=512,401,"AUTHENTICATION_REQUIRED");var actor=identity.authenticate(token);SecurityContextHolder.getContext().setAuthentication(new UsernamePasswordAuthenticationToken(actor,null,List.of()));}
      catch(ApiError e){response.setStatus(401);response.setContentType("application/json");response.getWriter().write("{\"code\":\"AUTHENTICATION_REQUIRED\"}");return;}
     }
     chain.doFilter(request,response);
@@ -38,7 +44,7 @@ public class SecurityConfiguration {
     .dispatcherTypeMatchers(jakarta.servlet.DispatcherType.ASYNC).permitAll()
     .requestMatchers("/api/v1/auth/logout").authenticated()
     .requestMatchers("/api/v1/auth/**","/error").permitAll()
-    .requestMatchers("/api/v1/**","/ws").authenticated().anyRequest().denyAll())
+    .requestMatchers("/api/v1/**","/ws","/ws/**").authenticated().anyRequest().denyAll())
    .exceptionHandling(e->e.authenticationEntryPoint((req,res,error)->{res.setStatus(401);res.setContentType("application/json");res.getWriter().write("{\"code\":\"AUTHENTICATION_REQUIRED\"}");}))
    .build();
  }

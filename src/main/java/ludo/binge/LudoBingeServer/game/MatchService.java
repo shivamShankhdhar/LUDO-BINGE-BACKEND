@@ -16,7 +16,10 @@ public class MatchService {
  private final boolean workers;
  private final GameEngine engine=new GameEngine();
  private final SecureRandom random=new SecureRandom();
- public MatchService(Store db,@Value("${ludo.workers.enabled:true}") boolean workers){this.db=db;this.workers=workers;}
+ private final ludo.binge.LudoBingeServer.realtime.RealtimeNotifier notifier;
+ @org.springframework.beans.factory.annotation.Autowired
+ public MatchService(Store db,@Value("${ludo.workers.enabled:true}") boolean workers,@org.springframework.context.annotation.Lazy ludo.binge.LudoBingeServer.realtime.RealtimeNotifier notifier){this.db=db;this.workers=workers;this.notifier=notifier;}
+ public MatchService(Store db,boolean workers){this(db,workers,null);}
  public Object snapshot(UUID user,UUID room){
   require(!db.rows("SELECT 1 FROM room_members WHERE room_id=? AND user_id=?",room,user).isEmpty(),403,"NOT_A_MEMBER");
   var matches=db.rows("SELECT * FROM matches WHERE room_id=? ORDER BY created_at DESC LIMIT 1",room);
@@ -58,8 +61,9 @@ public class MatchService {
  private void save(Map<String,Object> row,GameEngine.Transition transition,Integer rolled){
   var state=transition.state();UUID match=uuid(row.get("id")),room=uuid(row.get("room_id"));long revision=((Number)row.get("revision")).longValue()+1;
   var event=new LinkedHashMap<String,Object>();event.put("effects",transition.effects());event.put("path",transition.path());event.put("dice",rolled);event.put("revision",revision);
-  db.update("UPDATE matches SET snapshot=?::jsonb,revision=?,status=?,deadline=now()+interval '30 seconds',finished_at=CASE WHEN ? THEN now() ELSE NULL END WHERE id=?",db.encode(state),revision,state.phase().equals("FINISHED")?"FINISHED":"PLAYING",state.phase().equals("FINISHED"),match);
+  db.update("UPDATE matches SET snapshot=?::jsonb,revision=?,status=?,deadline=now()+interval '45 seconds',finished_at=CASE WHEN ? THEN now() ELSE NULL END WHERE id=?",db.encode(state),revision,state.phase().equals("FINISHED")?"FINISHED":"PLAYING",state.phase().equals("FINISHED"),match);
   db.update("INSERT INTO game_events(match_id,seq,event_id,payload) VALUES (?,?,?,?::jsonb)",match,revision,id(),db.encode(event));
+  if(notifier!=null){try{notifier.broadcastMatchUpdate(match,view(db.one("SELECT * FROM matches WHERE id=?",match)));}catch(Exception ignored){}}
   if(state.phase().equals("FINISHED")){
    db.update("UPDATE rooms SET phase='FINISHED',revision=revision+1 WHERE id=?",room);db.update("DELETE FROM user_allocations WHERE resource_id=?",room);
    for(var player:state.players())if(db.update("INSERT INTO result_applications(match_id,user_id) VALUES (?,?) ON CONFLICT DO NOTHING",match,uuid(player.userId()))==1)
@@ -74,7 +78,7 @@ public class MatchService {
     var rooms=db.rows("SELECT * FROM rooms WHERE phase='COUNTDOWN' AND countdown_at<=now() ORDER BY countdown_at LIMIT 10 FOR UPDATE SKIP LOCKED");
     for(var room:rooms){UUID roomId=uuid(room.get("id"));var players=db.rows("SELECT u.id,u.display_name,u.avatar_url,u.avatar_version,m.seat,(u.connected_until>now()) AS connected FROM room_members m JOIN users u ON u.id=m.user_id WHERE m.room_id=? ORDER BY seat",roomId);
      if(players.size()!=(int)room.get("capacity")||players.stream().anyMatch(p->!Boolean.TRUE.equals(p.get("connected")))){db.update("UPDATE rooms SET phase='LOBBY',countdown_at=NULL,revision=revision+1 WHERE id=?",roomId);db.update("UPDATE room_members SET ready=false WHERE room_id=?",roomId);continue;}
-     UUID match=id();var state=engine.initial(players.stream().map(p->p.get("id").toString()).toList());db.update("INSERT INTO matches(id,room_id,snapshot,deadline) VALUES (?,?,?::jsonb,now()+interval '30 seconds')",match,roomId,db.encode(state));
+     UUID match=id();var state=engine.initial(players.stream().map(p->p.get("id").toString()).toList());db.update("INSERT INTO matches(id,room_id,snapshot,deadline) VALUES (?,?,?::jsonb,now()+interval '45 seconds')",match,roomId,db.encode(state));
      for(int seat=0;seat<players.size();seat++){var p=players.get(seat);db.update("INSERT INTO match_players(match_id,user_id,seat,profile) VALUES (?,?,?,?::jsonb)",match,p.get("id"),seat,db.encode(p));}
      db.update("UPDATE rooms SET phase='PLAYING',revision=revision+1 WHERE id=?",roomId);
     }return null;
