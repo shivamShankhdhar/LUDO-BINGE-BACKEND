@@ -18,6 +18,11 @@ import java.util.concurrent.ConcurrentHashMap;
 import static ludo.binge.LudoBingeServer.shared.Store.uuid;
 import static ludo.binge.LudoBingeServer.shared.Store.id;
 
+/**
+ * Authoritative WebSocket & Real-Time Event Gateway.
+ * Bridges full-duplex socket connections with Redis state management,
+ * WebRTC low-latency audio signaling, and real-time game broadcasts.
+ */
 @Component
 public class OnlineWebSocketHandler extends TextWebSocketHandler implements RealtimeNotifier {
     private static final Logger log = LoggerFactory.getLogger(OnlineWebSocketHandler.class);
@@ -25,17 +30,24 @@ public class OnlineWebSocketHandler extends TextWebSocketHandler implements Real
     private final Store db;
     private final IdentityService identity;
     private final MatchService matchService;
+    private final RedisRealtimeService realtime;
 
-    // Track active sessions per user
+    // Local sessions
     private final Map<UUID, Set<WebSocketSession>> userSessions = new ConcurrentHashMap<>();
-    // Track sessions subscribed to specific rooms or matches
     private final Map<String, Set<WebSocketSession>> roomSubscriptions = new ConcurrentHashMap<>();
     private final Map<String, Set<WebSocketSession>> matchSubscriptions = new ConcurrentHashMap<>();
+    private final Set<String> subscribedRedisTopics = ConcurrentHashMap.newKeySet();
 
-    public OnlineWebSocketHandler(Store db, IdentityService identity, @Lazy MatchService matchService) {
+    public OnlineWebSocketHandler(
+            Store db,
+            IdentityService identity,
+            @Lazy MatchService matchService,
+            RedisRealtimeService realtime
+    ) {
         this.db = db;
         this.identity = identity;
         this.matchService = matchService;
+        this.realtime = realtime;
     }
 
     @Override
@@ -47,11 +59,17 @@ public class OnlineWebSocketHandler extends TextWebSocketHandler implements Real
         }
 
         userSessions.computeIfAbsent(actor.userId(), k -> ConcurrentHashMap.newKeySet()).add(session);
+        realtime.setPresence(actor.userId(), "ONLINE", null);
+
+        // Subscribe to direct user events in Redis
+        ensureRedisUserSubscription(actor.userId());
+
         // Renew presence in DB
         db.update("UPDATE users SET connected_until=now()+interval '2 minutes' WHERE id=?", actor.userId());
 
         send(session, Map.of(
             "type", "CONNECTED",
+            "event", "connected",
             "userId", actor.userId().toString(),
             "serverTimeMs", System.currentTimeMillis()
         ));
@@ -67,31 +85,38 @@ public class OnlineWebSocketHandler extends TextWebSocketHandler implements Real
 
         try {
             Map<?, ?> payload = db.decode(message.getPayload(), Map.class);
+            // Support both "type" and Socket.IO-style "event" / "action"
             String type = Objects.toString(payload.get("type"), "");
+            if (type.isBlank()) {
+                type = Objects.toString(payload.get("event"), "").toUpperCase();
+            }
 
             switch (type) {
-                case "SUBSCRIBE_ROOM" -> {
+                case "SUBSCRIBE_ROOM", "JOIN_ROOM" -> {
                     String roomId = Objects.toString(payload.get("roomId"), "");
                     if (!roomId.isBlank()) {
                         roomSubscriptions.computeIfAbsent(roomId, k -> ConcurrentHashMap.newKeySet()).add(session);
-                        send(session, Map.of("type", "ROOM_SUBSCRIBED", "roomId", roomId));
+                        ensureRedisRoomSubscription(roomId);
+                        realtime.setPresence(actor.userId(), "IN_ROOM", uuid(roomId));
+                        send(session, Map.of("type", "ROOM_SUBSCRIBED", "event", "room_subscribed", "roomId", roomId));
                     }
                 }
-                case "SUBSCRIBE_MATCH" -> {
+                case "SUBSCRIBE_MATCH", "JOIN_MATCH" -> {
                     String matchId = Objects.toString(payload.get("matchId"), "");
                     if (!matchId.isBlank()) {
                         matchSubscriptions.computeIfAbsent(matchId, k -> ConcurrentHashMap.newKeySet()).add(session);
-                        send(session, Map.of("type", "MATCH_SUBSCRIBED", "matchId", matchId));
+                        ensureRedisMatchSubscription(matchId);
+                        send(session, Map.of("type", "MATCH_SUBSCRIBED", "event", "match_subscribed", "matchId", matchId));
                     }
                 }
-                case "ROLL" -> {
+                case "ROLL", "ROLL_DICE" -> {
                     UUID matchId = uuid(payload.get("matchId"));
                     long revision = ((Number) payload.get("revision")).longValue();
                     UUID key = payload.containsKey("key") ? uuid(payload.get("key")) : id();
                     Object updated = matchService.command(actor.userId(), matchId, key, revision, "ROLL", null);
                     broadcastMatchUpdate(matchId, updated);
                 }
-                case "MOVE" -> {
+                case "MOVE", "MOVE_PAWN" -> {
                     UUID matchId = uuid(payload.get("matchId"));
                     long revision = ((Number) payload.get("revision")).longValue();
                     int pawn = ((Number) payload.get("pawn")).intValue();
@@ -106,7 +131,7 @@ public class OnlineWebSocketHandler extends TextWebSocketHandler implements Real
                     Object updated = matchService.command(actor.userId(), matchId, key, revision, "FORFEIT", null);
                     broadcastMatchUpdate(matchId, updated);
                 }
-                case "REACTION" -> {
+                case "REACTION", "SEND_REACTION" -> {
                     String roomId = Objects.toString(payload.get("roomId"), "");
                     String body = Objects.toString(payload.get("body"), "");
                     if (!roomId.isBlank() && !body.isBlank()) {
@@ -114,31 +139,36 @@ public class OnlineWebSocketHandler extends TextWebSocketHandler implements Real
                         String senderName = userRow != null ? Objects.toString(userRow.get("display_name"), "Player") : "Player";
                         Map<String, Object> reactionEvent = Map.of(
                             "type", "REACTION",
+                            "event", "reaction",
                             "roomId", roomId,
                             "senderId", actor.userId().toString(),
                             "senderName", senderName,
                             "body", body,
                             "timestamp", System.currentTimeMillis()
                         );
-                        broadcastToRoom(roomId, reactionEvent);
+                        // Broadcast via Redis Pub/Sub so all clustered nodes receive it
+                        realtime.publishRoomEvent(roomId, reactionEvent);
                     }
                 }
-                case "VOICE_SIGNAL" -> {
-                    // Instant WebRTC signaling directly to recipient session
+                case "VOICE_SIGNAL", "SIGNAL" -> {
                     String recipientStr = Objects.toString(payload.get("recipient"), "");
                     if (!recipientStr.isBlank()) {
                         UUID recipient = uuid(recipientStr);
                         Map<String, Object> signalMsg = Map.of(
                             "type", "VOICE_SIGNAL",
+                            "event", "voice_signal",
                             "sender", actor.userId().toString(),
                             "signal", payload.get("signal")
                         );
-                        sendToUser(recipient, signalMsg);
+                        // Publish through Redis Pub/Sub directly to recipient user channel
+                        realtime.publishUserEvent(recipient, signalMsg);
                     }
                 }
-                case "PING" -> {
+                case "PING", "HEARTBEAT" -> {
+                    realtime.setPresence(actor.userId(), "ACTIVE", null);
                     send(session, Map.of(
                         "type", "PONG",
+                        "event", "pong",
                         "serverTimeMs", System.currentTimeMillis()
                     ));
                     db.update("UPDATE users SET connected_until=now()+interval '2 minutes' WHERE id=?", actor.userId());
@@ -147,7 +177,7 @@ public class OnlineWebSocketHandler extends TextWebSocketHandler implements Real
             }
         } catch (Exception e) {
             log.warn("Error handling websocket message: {}", e.getMessage());
-            send(session, Map.of("type", "ERROR", "message", e.getMessage()));
+            send(session, Map.of("type", "ERROR", "event", "error", "message", e.getMessage()));
         }
     }
 
@@ -158,7 +188,10 @@ public class OnlineWebSocketHandler extends TextWebSocketHandler implements Real
             Set<WebSocketSession> sessions = userSessions.get(actor.userId());
             if (sessions != null) {
                 sessions.remove(session);
-                if (sessions.isEmpty()) userSessions.remove(actor.userId());
+                if (sessions.isEmpty()) {
+                    userSessions.remove(actor.userId());
+                    realtime.removePresence(actor.userId());
+                }
             }
         }
         roomSubscriptions.values().forEach(set -> set.remove(session));
@@ -168,61 +201,76 @@ public class OnlineWebSocketHandler extends TextWebSocketHandler implements Real
     @Override
     public void broadcastMatchUpdate(UUID matchId, Object snapshot) {
         String key = matchId.toString();
-        Set<WebSocketSession> subscribers = matchSubscriptions.get(key);
-        if (subscribers != null && !subscribers.isEmpty()) {
-            Map<String, Object> msg = Map.of(
-                "type", "MATCH_UPDATE",
-                "matchId", key,
-                "data", snapshot
-            );
-            String encoded = db.encode(msg);
-            for (WebSocketSession s : subscribers) {
-                if (s.isOpen()) {
-                    try { s.sendMessage(new TextMessage(encoded)); } catch (Exception ignored) {}
-                }
-            }
-        }
+        // Cache snapshot in Redis
+        realtime.cacheMatchSnapshot(matchId, snapshot);
+
+        Map<String, Object> msg = Map.of(
+            "type", "MATCH_UPDATE",
+            "event", "match_update",
+            "matchId", key,
+            "data", snapshot
+        );
+        // Publish via Redis Pub/Sub
+        realtime.publishMatchEvent(key, msg);
     }
 
     @Override
     public void broadcastRoomUpdate(UUID roomId, Object snapshot) {
         String key = roomId.toString();
-        Set<WebSocketSession> subscribers = roomSubscriptions.get(key);
-        if (subscribers != null && !subscribers.isEmpty()) {
-            Map<String, Object> msg = Map.of(
-                "type", "ROOM_UPDATE",
-                "roomId", key,
-                "data", snapshot
-            );
-            String encoded = db.encode(msg);
-            for (WebSocketSession s : subscribers) {
-                if (s.isOpen()) {
-                    try { s.sendMessage(new TextMessage(encoded)); } catch (Exception ignored) {}
+        realtime.cacheRoomState(roomId, snapshot);
+
+        Map<String, Object> msg = Map.of(
+            "type", "ROOM_UPDATE",
+            "event", "room_update",
+            "roomId", key,
+            "data", snapshot
+        );
+        realtime.publishRoomEvent(key, msg);
+    }
+
+    private void ensureRedisRoomSubscription(String roomId) {
+        String topic = "ludo:channel:room:" + roomId;
+        if (subscribedRedisTopics.add(topic)) {
+            realtime.subscribe(topic, jsonMessage -> {
+                Set<WebSocketSession> subscribers = roomSubscriptions.get(roomId);
+                if (subscribers != null) {
+                    broadcastLocalText(subscribers, jsonMessage);
                 }
-            }
+            });
         }
     }
 
-    private void broadcastToRoom(String roomId, Object payload) {
-        Set<WebSocketSession> subscribers = roomSubscriptions.get(roomId);
-        if (subscribers != null && !subscribers.isEmpty()) {
-            String encoded = db.encode(payload);
-            for (WebSocketSession s : subscribers) {
-                if (s.isOpen()) {
-                    try { s.sendMessage(new TextMessage(encoded)); } catch (Exception ignored) {}
+    private void ensureRedisMatchSubscription(String matchId) {
+        String topic = "ludo:channel:match:" + matchId;
+        if (subscribedRedisTopics.add(topic)) {
+            realtime.subscribe(topic, jsonMessage -> {
+                Set<WebSocketSession> subscribers = matchSubscriptions.get(matchId);
+                if (subscribers != null) {
+                    broadcastLocalText(subscribers, jsonMessage);
                 }
-            }
+            });
         }
     }
 
-    private void sendToUser(UUID recipient, Object payload) {
-        Set<WebSocketSession> sessions = userSessions.get(recipient);
-        if (sessions != null && !sessions.isEmpty()) {
-            String encoded = db.encode(payload);
-            for (WebSocketSession s : sessions) {
-                if (s.isOpen()) {
-                    try { s.sendMessage(new TextMessage(encoded)); } catch (Exception ignored) {}
+    private void ensureRedisUserSubscription(UUID userId) {
+        String topic = "ludo:channel:user:" + userId;
+        if (subscribedRedisTopics.add(topic)) {
+            realtime.subscribe(topic, jsonMessage -> {
+                Set<WebSocketSession> sessions = userSessions.get(userId);
+                if (sessions != null) {
+                    broadcastLocalText(sessions, jsonMessage);
                 }
+            });
+        }
+    }
+
+    private void broadcastLocalText(Set<WebSocketSession> sessions, String rawJson) {
+        TextMessage text = new TextMessage(rawJson);
+        for (WebSocketSession s : sessions) {
+            if (s.isOpen()) {
+                try {
+                    s.sendMessage(text);
+                } catch (Exception ignored) {}
             }
         }
     }
