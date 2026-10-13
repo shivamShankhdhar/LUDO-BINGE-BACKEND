@@ -34,7 +34,7 @@ public class SecurityConfiguration {
   return http.csrf(c->c.disable()).sessionManagement(s->s.sessionCreationPolicy(SessionCreationPolicy.STATELESS)).requestCache(c->c.disable())
    .addFilterBefore(bearer,UsernamePasswordAuthenticationFilter.class)
    .authorizeHttpRequests(a->a
-    .requestMatchers(org.springframework.http.HttpMethod.GET,"/api/v1/capabilities","/api/v1/config","/actuator/health","/actuator/health/**","/r/**").permitAll()
+    .requestMatchers(org.springframework.http.HttpMethod.GET,"/api/v1/capabilities","/api/v1/config","/api/v1/leaderboard","/actuator/health","/actuator/health/**","/r/**").permitAll()
     .dispatcherTypeMatchers(jakarta.servlet.DispatcherType.ASYNC).permitAll()
     .requestMatchers("/api/v1/auth/logout").authenticated()
     .requestMatchers("/api/v1/auth/**","/error").permitAll()

@@ -82,5 +82,66 @@ public class OnlineController {
   require(db.jdbc.queryForObject("SELECT count(*) FROM voice_members WHERE room_id=? AND user_id IN (?,?) AND expires_at>now()",Integer.class,room,u,signal.recipient())==2,409,"VOICE_PEER_OFFLINE");
   db.update("INSERT INTO voice_signals(room_id,sender,recipient,payload) VALUES (?,?,?,?::jsonb)",room,u,signal.recipient(),db.encode(signal));return Map.of("sent",true);
  }
+ @GetMapping("/leaderboard")
+ public Object leaderboard(Authentication auth, @RequestParam(defaultValue="weekly") String period) {
+  UUID u = (auth != null && auth.getPrincipal() instanceof Actor a) ? a.userId() : null;
+  var rows = db.rows(
+   "SELECT u.id, u.display_name, u.avatar_url, " +
+   "COALESCE(s.played, 0) AS played, COALESCE(s.wins, 0) AS wins, COALESCE(s.forfeits, 0) AS forfeits, " +
+   "GREATEST(0, (COALESCE(s.wins, 0) * 100) + (COALESCE(s.played, 0) * 10) - (COALESCE(s.forfeits, 0) * 30)) AS points " +
+   "FROM users u " +
+   "LEFT JOIN player_stats s ON u.id = s.user_id " +
+   "WHERE u.status = 'ACTIVE' " +
+   "ORDER BY points DESC, wins DESC, played ASC LIMIT 50"
+  );
+  var items = new ArrayList<Map<String, Object>>();
+  int myRank = 0;
+  long myPoints = 0;
+  for (int i = 0; i < rows.size(); i++) {
+   var r = rows.get(i);
+   UUID userId = uuid(r.get("id"));
+   int rank = i + 1;
+   long points = ((Number) r.get("points")).longValue();
+   long played = ((Number) r.get("played")).longValue();
+   long wins = ((Number) r.get("wins")).longValue();
+   long forfeits = ((Number) r.get("forfeits")).longValue();
+   int winRate = played > 0 ? (int) Math.round((wins * 100.0) / played) : 0;
+   if (u != null && u.equals(userId)) {
+    myRank = rank;
+    myPoints = points;
+   }
+   var item = new LinkedHashMap<String, Object>();
+   item.put("userId", userId.toString());
+   item.put("rank", rank);
+   item.put("displayName", r.get("display_name"));
+   item.put("avatarUrl", r.get("avatar_url"));
+   item.put("points", points);
+   item.put("played", played);
+   item.put("wins", wins);
+   item.put("forfeits", forfeits);
+   item.put("winRate", winRate);
+   items.add(item);
+  }
+  var res = new LinkedHashMap<String, Object>();
+  res.put("items", items);
+  res.put("totalUsers", items.size());
+  res.put("period", period);
+  res.put("myRank", myRank);
+  res.put("myPoints", myPoints);
+  if (myRank > 0 && items.size() > 1) {
+   int beaten = items.size() - myRank;
+   int pct = (int) Math.round((beaten * 100.0) / (items.size() - 1));
+   res.put("summaryText", "You are doing better than " + Math.max(10, pct) + "% of other players!");
+  } else if (myRank == 1) {
+   res.put("summaryText", "You are leading the leaderboard at #1!");
+  } else {
+   res.put("summaryText", "Play online matches to climb up the leaderboard ranks!");
+  }
+  long now = System.currentTimeMillis();
+  long weekMs = 7L * 24 * 3600 * 1000;
+  long remainingSeconds = (weekMs - (now % weekMs)) / 1000;
+  res.put("resetSeconds", remainingSeconds);
+  return res;
+ }
  @PreDestroy void close(){connections.values().forEach(SseEmitter::complete);streams.shutdownNow();}
 }
