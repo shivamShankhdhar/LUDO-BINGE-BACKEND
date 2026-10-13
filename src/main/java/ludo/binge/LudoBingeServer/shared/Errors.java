@@ -7,6 +7,10 @@ import org.springframework.web.bind.MethodArgumentNotValidException;
 import org.springframework.http.converter.HttpMessageNotReadableException;
 @RestControllerAdvice
 public class Errors {
+ // A disconnected SSE client has no writable response. Do not turn normal disconnects into JSON 500s.
+ @ExceptionHandler(org.springframework.web.context.request.async.AsyncRequestNotUsableException.class)
+ void disconnectedStream() {}
+
  @ExceptionHandler(org.springframework.dao.DataAccessException.class) ResponseEntity<?> unavailable(Exception e) {
   org.slf4j.LoggerFactory.getLogger(Errors.class).error("Database request failed", e);
   

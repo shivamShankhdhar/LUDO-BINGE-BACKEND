@@ -34,7 +34,8 @@ public class OnlineController {
  public record Search(@Min(2) @Max(6) int count){}
  @PostMapping("/matchmaking/tickets") Object search(Authentication auth,@RequestHeader("Idempotency-Key") UUID key,@Valid @RequestBody Search body){UUID u=user(auth);db.limit("queue:"+u,12,60);return db.mutate(u,key,"queue",body,()->queue.enter(u,body.count()));}
  @PostMapping("/matchmaking/cancel") Object cancel(Authentication auth,@RequestHeader("Idempotency-Key") UUID key){UUID u=user(auth);return db.mutate(u,key,"queue-cancel",Map.of(),()->queue.cancel(u));}
- @PostMapping("/matchmaking/accept") Object accept(Authentication auth,@RequestHeader("Idempotency-Key") UUID key){UUID u=user(auth);return db.mutate(u,key,"queue-accept",Map.of(),()->queue.accept(u));}
+ public record Accept(UUID proposalId){}
+ @PostMapping("/matchmaking/accept") Object accept(Authentication auth,@RequestHeader("Idempotency-Key") UUID key,@RequestBody(required=false) Accept body){UUID u=user(auth);var request=body==null?new Accept(null):body;return db.mutate(u,key,"queue-accept",request,()->queue.accept(u,request.proposalId()));}
  @GetMapping("/matchmaking/tickets") Object ticket(Authentication auth){return queue.ticket(user(auth));}
  @PostMapping("/rooms/requests/cancel") Object cancelRequest(Authentication auth){db.update("UPDATE join_requests SET status='CANCELLED' WHERE user_id=? AND status='PENDING'",user(auth));return Map.of("cancelled",true);}
  public record Configure(@Min(2) @Max(6) int count,long revision){}
@@ -52,15 +53,23 @@ public class OnlineController {
    result.put("signals",db.rows("SELECT id,sender,payload FROM voice_signals WHERE room_id=? AND recipient=? AND created_at>now()-interval '30 seconds' ORDER BY id",room,u).stream().map(s->Map.of("id",s.get("id"),"sender",s.get("sender"),"payload",db.decode(s.get("payload"),Object.class))).toList());
   }
   result.put("pendingRequests",db.rows("SELECT room_id AS \"roomId\",status FROM join_requests WHERE user_id=? AND status='PENDING' AND expires_at>now() ORDER BY created_at DESC LIMIT 1",u));
+  var request=db.rows("SELECT room_id AS \"roomId\",CASE WHEN status='PENDING' AND expires_at<=now() THEN 'EXPIRED' ELSE status END AS status FROM join_requests WHERE user_id=? ORDER BY created_at DESC LIMIT 1",u);
+  if(!request.isEmpty())result.put("joinRequest",request.getFirst());
   result.put("serverTimeMs",System.currentTimeMillis());return result;
  });}
  @GetMapping("/sync") Object sync(Authentication auth,@RequestParam(required=false) UUID room){return snapshot(user(auth),room);}
- @GetMapping(value="/live",produces="text/event-stream") SseEmitter live(Authentication auth,@RequestParam(required=false) UUID room){
+ @GetMapping(value="/live",produces="text/event-stream") SseEmitter live(Authentication auth,@RequestParam(required=false) UUID room,jakarta.servlet.http.HttpServletResponse response){
+  response.setHeader("Cache-Control","no-cache, no-transform");
+  response.setHeader("X-Accel-Buffering","no");
   Actor actor=(Actor)auth.getPrincipal();UUID u=actor.userId();db.limit("live:"+u,30,60);
   SseEmitter emitter=new SseEmitter(60_000L);SseEmitter old=connections.put(u,emitter);if(old!=null)old.complete();
   emitter.onCompletion(()->connections.remove(u,emitter));emitter.onTimeout(()->connections.remove(u,emitter));emitter.onError(e->connections.remove(u,emitter));
-  streams.submit(()->{try{UUID retainedRoom=room;long end=System.currentTimeMillis()+55_000;while(connections.get(u)==emitter&&System.currentTimeMillis()<end){
+  streams.submit(()->{try{UUID retainedRoom=room;long nextPresence=0;long end=System.currentTimeMillis()+55_000;while(connections.get(u)==emitter&&System.currentTimeMillis()<end){
    if(!identity.valid(actor))break;
+   if(System.currentTimeMillis()>=nextPresence){
+    db.update("UPDATE users SET connected_until=now()+interval '20 seconds' WHERE id=?",u);
+    nextPresence=System.currentTimeMillis()+5000;
+   }
    Object value=snapshot(u,retainedRoom);
    if(value instanceof Map<?,?> map && map.get("room") instanceof Map<?,?> activeRoom)retainedRoom=uuid(activeRoom.get("id"));
    emitter.send(SseEmitter.event().name("snapshot").data(db.encode(value)));Thread.sleep(400);
@@ -85,22 +94,37 @@ public class OnlineController {
  @GetMapping("/leaderboard")
  public Object leaderboard(Authentication auth, @RequestParam(defaultValue="weekly") String period) {
   UUID u = (auth != null && auth.getPrincipal() instanceof Actor a) ? a.userId() : null;
-  var rows = db.rows(
-   "SELECT u.id, u.display_name, u.avatar_url, " +
-   "COALESCE(s.played, 0) AS played, COALESCE(s.wins, 0) AS wins, COALESCE(s.forfeits, 0) AS forfeits, " +
-   "GREATEST(0, (COALESCE(s.wins, 0) * 100) + (COALESCE(s.played, 0) * 10) - (COALESCE(s.forfeits, 0) * 30)) AS points " +
-   "FROM users u " +
-   "LEFT JOIN player_stats s ON u.id = s.user_id " +
-   "WHERE u.status = 'ACTIVE' " +
-   "ORDER BY points DESC, wins DESC, played ASC LIMIT 50"
-  );
+  require(Set.of("weekly", "all_time").contains(period),400,"INVALID_PERIOD");
+  var now = java.time.ZonedDateTime.now(java.time.ZoneOffset.UTC);
+  var weekStart = now.toLocalDate().with(java.time.temporal.TemporalAdjusters.previousOrSame(java.time.DayOfWeek.MONDAY)).atStartOfDay(java.time.ZoneOffset.UTC);
+  String stats = period.equals("weekly") ? """
+   SELECT (p->>'userId')::uuid AS user_id, count(*) AS played,
+          count(*) FILTER (WHERE m.snapshot->>'winner'=p->>'userId') AS wins,
+          count(*) FILTER (WHERE (p->>'forfeited')::boolean) AS forfeits
+   FROM matches m CROSS JOIN LATERAL jsonb_array_elements(m.snapshot->'players') p
+   WHERE m.status='FINISHED' AND m.finished_at>=? AND m.finished_at<?
+   GROUP BY (p->>'userId')::uuid
+   """ : "SELECT user_id,played,wins,forfeits FROM player_stats";
+  String query = "WITH stats AS (" + stats + """
+   ), ranked AS (
+    SELECT u.id,u.display_name,u.avatar_url,s.played,s.wins,s.forfeits,
+     GREATEST(0,s.wins*100+s.played*10-s.forfeits*30) AS points,
+     row_number() OVER (ORDER BY GREATEST(0,s.wins*100+s.played*10-s.forfeits*30) DESC,s.wins DESC,s.played ASC,u.id) AS rank,
+     count(*) OVER () AS total
+    FROM users u JOIN stats s ON s.user_id=u.id WHERE u.status='ACTIVE' AND s.played>0
+   ) SELECT * FROM ranked WHERE rank<=50 OR id=? ORDER BY rank
+   """;
+  var rows = period.equals("weekly")
+   ? db.rows(query,java.sql.Timestamp.from(weekStart.toInstant()),java.sql.Timestamp.from(weekStart.plusWeeks(1).toInstant()),u)
+   : db.rows(query,u);
+  long totalUsers = rows.isEmpty() ? 0 : ((Number)rows.getFirst().get("total")).longValue();
   var items = new ArrayList<Map<String, Object>>();
   int myRank = 0;
   long myPoints = 0;
   for (int i = 0; i < rows.size(); i++) {
    var r = rows.get(i);
    UUID userId = uuid(r.get("id"));
-   int rank = i + 1;
+   int rank = ((Number) r.get("rank")).intValue();
    long points = ((Number) r.get("points")).longValue();
    long played = ((Number) r.get("played")).longValue();
    long wins = ((Number) r.get("wins")).longValue();
@@ -120,27 +144,23 @@ public class OnlineController {
    item.put("wins", wins);
    item.put("forfeits", forfeits);
    item.put("winRate", winRate);
-   items.add(item);
+   if (rank <= 50) items.add(item);
   }
   var res = new LinkedHashMap<String, Object>();
   res.put("items", items);
-  res.put("totalUsers", items.size());
+  res.put("totalUsers", totalUsers);
   res.put("period", period);
   res.put("myRank", myRank);
   res.put("myPoints", myPoints);
-  if (myRank > 0 && items.size() > 1) {
-   int beaten = items.size() - myRank;
-   int pct = (int) Math.round((beaten * 100.0) / (items.size() - 1));
-   res.put("summaryText", "You are doing better than " + Math.max(10, pct) + "% of other players!");
-  } else if (myRank == 1) {
+  if (myRank == 1) {
    res.put("summaryText", "You are leading the leaderboard at #1!");
+  } else if (myRank > 0 && totalUsers > 1) {
+   int pct = (int) Math.round(((totalUsers - myRank) * 100.0) / (totalUsers - 1));
+   res.put("summaryText", "You are doing better than " + pct + "% of other players!");
   } else {
    res.put("summaryText", "Play online matches to climb up the leaderboard ranks!");
   }
-  long now = System.currentTimeMillis();
-  long weekMs = 7L * 24 * 3600 * 1000;
-  long remainingSeconds = (weekMs - (now % weekMs)) / 1000;
-  res.put("resetSeconds", remainingSeconds);
+  res.put("resetSeconds", period.equals("weekly") ? java.time.Duration.between(now,weekStart.plusWeeks(1)).getSeconds() : 0L);
   return res;
  }
  @PreDestroy void close(){connections.values().forEach(SseEmitter::complete);streams.shutdownNow();}

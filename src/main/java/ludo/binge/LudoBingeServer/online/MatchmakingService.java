@@ -39,7 +39,11 @@ public class MatchmakingService {
   db.update("UPDATE queue_tickets SET status='CANCELLED' WHERE id=? AND status<>'MATCHED'",t.get("id"));
   db.update("DELETE FROM user_allocations WHERE user_id=? AND kind='QUEUE'",user);return Map.of("cancelled",true);
  });}
- public Object accept(UUID user){return db.tx(()->{lock();var t=ticket(user);require(!t.isEmpty(),409,"NO_SEARCH");
+ public Object accept(UUID user){return accept(user,null);}
+ public Object accept(UUID user,UUID expectedProposal){return db.tx(()->{lock();var t=ticket(user);require(!t.isEmpty(),409,"NO_SEARCH");
+  require(expectedProposal==null||expectedProposal.equals(t.get("proposal_id")),409,"RESERVATION_EXPIRED");
+  // A retry after the final participant accepted must return the completed allocation.
+  if ("MATCHED".equals(t.get("status"))) return t;
   require(Set.of("RESERVED","ACCEPTED").contains(t.get("status")),409,"RESERVATION_EXPIRED");
   UUID proposal=uuid(t.get("proposal_id"));require(!db.rows("SELECT 1 FROM proposals WHERE id=? AND status='PENDING' AND expires_at>now()",proposal).isEmpty(),409,"RESERVATION_EXPIRED");
   db.update("UPDATE queue_tickets SET status='ACCEPTED' WHERE id=?",t.get("id"));
@@ -72,7 +76,7 @@ public class MatchmakingService {
    var candidates=db.rows("SELECT q.* FROM queue_tickets q JOIN users u ON u.id=q.user_id WHERE q.status='SEARCHING' AND q.capacity=? AND q.expires_at>now() AND u.connected_until>now() ORDER BY q.created_at,q.id LIMIT 100",count);
    var group=new ArrayList<Map<String,Object>>();
    for(var candidate:candidates){UUID u=uuid(candidate.get("user_id"));if(group.stream().anyMatch(g->rooms.blocked(u,uuid(g.get("user_id")))))continue;group.add(candidate);if(group.size()==count)break;}
-   if(group.size()==count){UUID proposal=id();db.update("INSERT INTO proposals(id,capacity,expires_at) VALUES (?,?,now()+interval '10 seconds')",proposal,count);
+   if(group.size()==count){UUID proposal=id();db.update("INSERT INTO proposals(id,capacity,expires_at) VALUES (?,?,now()+interval '30 seconds')",proposal,count);
     for(var q:group)db.update("UPDATE queue_tickets SET status='RESERVED',proposal_id=? WHERE id=?",proposal,q.get("id"));
    }
   }return null;
