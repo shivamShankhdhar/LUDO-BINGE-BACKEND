@@ -27,8 +27,7 @@ public class SecurityConfiguration {
     String token=null;
     if(header!=null && header.startsWith("Bearer ")){
      token=header.substring(7);
-    } else if(uri.startsWith("/ws")){
-     token=request.getParameter("token");
+
     }
     if(token!=null){
      try{ApiError.require(token.length()<=512,401,"AUTHENTICATION_REQUIRED");var actor=identity.authenticate(token);SecurityContextHolder.getContext().setAuthentication(new UsernamePasswordAuthenticationToken(actor,null,List.of()));}

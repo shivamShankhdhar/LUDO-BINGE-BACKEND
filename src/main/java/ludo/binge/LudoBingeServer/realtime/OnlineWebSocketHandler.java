@@ -1,287 +1,106 @@
 package ludo.binge.LudoBingeServer.realtime;
 
+import java.util.*;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicBoolean;
+import jakarta.annotation.PostConstruct;
+import jakarta.annotation.PreDestroy;
+import org.springframework.stereotype.Component;
+import org.springframework.context.annotation.Lazy;
+import org.springframework.web.socket.*;
+import org.springframework.web.socket.handler.*;
 import ludo.binge.LudoBingeServer.identity.IdentityService;
 import ludo.binge.LudoBingeServer.identity.IdentityService.Actor;
-import ludo.binge.LudoBingeServer.shared.Store;
-import ludo.binge.LudoBingeServer.game.MatchService;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-import org.springframework.context.annotation.Lazy;
-import org.springframework.stereotype.Component;
-import org.springframework.web.socket.*;
-import org.springframework.web.socket.handler.TextWebSocketHandler;
+import ludo.binge.LudoBingeServer.shared.*;
+import ludo.binge.LudoBingeServer.online.*;
+import static ludo.binge.LudoBingeServer.shared.Store.*;
+import static ludo.binge.LudoBingeServer.shared.ApiError.require;
 
-import java.io.IOException;
-import java.util.*;
-import java.util.concurrent.ConcurrentHashMap;
-
-import static ludo.binge.LudoBingeServer.shared.Store.uuid;
-import static ludo.binge.LudoBingeServer.shared.Store.id;
-
-/**
- * Authoritative WebSocket & Real-Time Event Gateway.
- * Bridges full-duplex socket connections with Redis state management,
- * WebRTC low-latency audio signaling, and real-time game broadcasts.
- */
+/** Authenticated, acknowledged commands and personalized snapshots published after commit. */
 @Component
 public class OnlineWebSocketHandler extends TextWebSocketHandler implements RealtimeNotifier {
-    private static final Logger log = LoggerFactory.getLogger(OnlineWebSocketHandler.class);
-
-    private final Store db;
-    private final IdentityService identity;
-    private final MatchService matchService;
-    private final RedisRealtimeService realtime;
-
-    // Local sessions
-    private final Map<UUID, Set<WebSocketSession>> userSessions = new ConcurrentHashMap<>();
-    private final Map<String, Set<WebSocketSession>> roomSubscriptions = new ConcurrentHashMap<>();
-    private final Map<String, Set<WebSocketSession>> matchSubscriptions = new ConcurrentHashMap<>();
-    private final Set<String> subscribedRedisTopics = ConcurrentHashMap.newKeySet();
-
-    public OnlineWebSocketHandler(
-            Store db,
-            IdentityService identity,
-            @Lazy MatchService matchService,
-            RedisRealtimeService realtime
-    ) {
-        this.db = db;
-        this.identity = identity;
-        this.matchService = matchService;
-        this.realtime = realtime;
+ private final Store db;private final IdentityService identity;private final OnlineController online;private final OnlineSocketActions actions;private final RedisRealtimeService realtime;
+ private final Map<String,Client> clients=new ConcurrentHashMap<>();
+ private final ScheduledExecutorService dispatch=Executors.newSingleThreadScheduledExecutor();
+ private final ExecutorService writers=Executors.newVirtualThreadPerTaskExecutor();
+ private final AtomicBoolean pending=new AtomicBoolean();
+ private static final String CHANGES="ludo:channel:committed";
+ private static final class Client {
+  final WebSocketSession session;final Actor actor;final AtomicBoolean pushing=new AtomicBoolean();final AtomicBoolean dirty=new AtomicBoolean();UUID room;String fingerprint="";long sequence=0;
+  Client(WebSocketSession session,Actor actor){this.session=new ConcurrentWebSocketSessionDecorator(session,5000,512*1024);this.actor=actor;}
+ }
+ public OnlineWebSocketHandler(Store db,IdentityService identity,@Lazy OnlineController online,@Lazy OnlineSocketActions actions,RedisRealtimeService realtime){this.db=db;this.identity=identity;this.online=online;this.actions=actions;this.realtime=realtime;}
+ @PostConstruct void listen(){
+  realtime.subscribe(CHANGES,ignored->scheduleSnapshots());
+  db.onCommittedChange(()->{if(!dispatch.isShutdown())dispatch.execute(()->realtime.publish(CHANGES,"changed"));});
+ }
+ private void scheduleSnapshots(){
+  if(dispatch.isShutdown()||!pending.compareAndSet(false,true))return;
+  dispatch.schedule(()->{pending.set(false);for(var client:clients.values())push(client);},20,TimeUnit.MILLISECONDS);
+ }
+ private void push(Client client){
+  client.dirty.set(true);if(!client.pushing.compareAndSet(false,true))return;
+  writers.submit(()->{try{while(client.dirty.getAndSet(false))snapshot(client,false);}catch(Exception e){close(client);}finally{client.pushing.set(false);if(client.dirty.get()&&client.session.isOpen())push(client);}});
+ }
+ @Override public void afterConnectionEstablished(WebSocketSession session)throws Exception{
+  require(session.getAttributes().get("actor") instanceof Actor,401,"AUTHENTICATION_REQUIRED");
+  Actor actor=(Actor)session.getAttributes().get("actor");db.limit("socket:"+actor.userId(),30,60);
+  session.setTextMessageSizeLimit(32768);var client=new Client(session,actor);clients.put(session.getId(),client);
+  presence(actor);send(client,Map.of("type","CONNECTED","protocolVersion",2));snapshot(client,true);
+ }
+ private void presence(Actor actor){db.update("UPDATE users SET connected_until=now()+interval '30 seconds' WHERE id=?",actor.userId());}
+ @Override protected void handleTextMessage(WebSocketSession session,TextMessage message){
+  Client client=clients.get(session.getId());if(client==null)return;String requestId="";
+  try{
+   require(identity.valid(client.actor),401,"AUTHENTICATION_REQUIRED");
+   var frame=db.decode(message.getPayload(),Map.class);String type=Objects.toString(frame.get("type"),"");requestId=Objects.toString(frame.get("requestId"),"");
+   require(requestId.length()<=64,400,"INVALID_REQUEST");db.limit("socket-frame:"+client.actor.userId(),600,60);
+   switch(type){
+    case "PING" -> {presence(client.actor);send(client,Map.of("type","PONG","serverTimeMs",System.currentTimeMillis()));}
+    case "SYNC" -> {
+     synchronized(client){String room=Objects.toString(frame.get("room"),"");client.room=room.isBlank()?null:uuid(room);snapshot(client,true);}
+     send(client,Map.of("type","ACK","requestId",requestId,"data",Map.of("synced",true)));
     }
-
-    @Override
-    public void afterConnectionEstablished(WebSocketSession session) {
-        Actor actor = (Actor) session.getAttributes().get("actor");
-        if (actor == null) {
-            try { session.close(CloseStatus.NOT_ACCEPTABLE); } catch (Exception ignored) {}
-            return;
-        }
-
-        userSessions.computeIfAbsent(actor.userId(), k -> ConcurrentHashMap.newKeySet()).add(session);
-        realtime.setPresence(actor.userId(), "ONLINE", null);
-
-        // Subscribe to direct user events in Redis
-        ensureRedisUserSubscription(actor.userId());
-
-        // Renew presence in DB
-        db.update("UPDATE users SET connected_until=now()+interval '2 minutes' WHERE id=?", actor.userId());
-
-        send(session, Map.of(
-            "type", "CONNECTED",
-            "event", "connected",
-            "userId", actor.userId().toString(),
-            "serverTimeMs", System.currentTimeMillis()
-        ));
+    case "REQUEST" -> {
+     require(!requestId.isBlank()&&frame.get("body") instanceof Map,400,"INVALID_REQUEST");
+     UUID key=uuid(frame.get("key"));String path=Objects.toString(frame.get("path"),"");
+     Object result=actions.execute(client.actor,path,(Map<?,?>)frame.get("body"),key);
+     send(client,Map.of("type","ACK","requestId",requestId,"data",result));snapshot(client,true);
     }
-
-    @Override
-    protected void handleTextMessage(WebSocketSession session, TextMessage message) {
-        Actor actor = (Actor) session.getAttributes().get("actor");
-        if (actor == null || !identity.valid(actor)) {
-            try { session.close(CloseStatus.NOT_ACCEPTABLE); } catch (Exception ignored) {}
-            return;
-        }
-
-        try {
-            Map<?, ?> payload = db.decode(message.getPayload(), Map.class);
-            // Support both "type" and Socket.IO-style "event" / "action"
-            String type = Objects.toString(payload.get("type"), "");
-            if (type.isBlank()) {
-                type = Objects.toString(payload.get("event"), "").toUpperCase();
-            }
-
-            switch (type) {
-                case "SUBSCRIBE_ROOM", "JOIN_ROOM" -> {
-                    String roomId = Objects.toString(payload.get("roomId"), "");
-                    if (!roomId.isBlank()) {
-                        roomSubscriptions.computeIfAbsent(roomId, k -> ConcurrentHashMap.newKeySet()).add(session);
-                        ensureRedisRoomSubscription(roomId);
-                        realtime.setPresence(actor.userId(), "IN_ROOM", uuid(roomId));
-                        send(session, Map.of("type", "ROOM_SUBSCRIBED", "event", "room_subscribed", "roomId", roomId));
-                    }
-                }
-                case "SUBSCRIBE_MATCH", "JOIN_MATCH" -> {
-                    String matchId = Objects.toString(payload.get("matchId"), "");
-                    if (!matchId.isBlank()) {
-                        matchSubscriptions.computeIfAbsent(matchId, k -> ConcurrentHashMap.newKeySet()).add(session);
-                        ensureRedisMatchSubscription(matchId);
-                        send(session, Map.of("type", "MATCH_SUBSCRIBED", "event", "match_subscribed", "matchId", matchId));
-                    }
-                }
-                case "ROLL", "ROLL_DICE" -> {
-                    UUID matchId = uuid(payload.get("matchId"));
-                    long revision = ((Number) payload.get("revision")).longValue();
-                    UUID key = payload.containsKey("key") ? uuid(payload.get("key")) : id();
-                    Object updated = matchService.command(actor.userId(), matchId, key, revision, "ROLL", null);
-                    broadcastMatchUpdate(matchId, updated);
-                }
-                case "MOVE", "MOVE_PAWN" -> {
-                    UUID matchId = uuid(payload.get("matchId"));
-                    long revision = ((Number) payload.get("revision")).longValue();
-                    int pawn = ((Number) payload.get("pawn")).intValue();
-                    UUID key = payload.containsKey("key") ? uuid(payload.get("key")) : id();
-                    Object updated = matchService.command(actor.userId(), matchId, key, revision, "MOVE", pawn);
-                    broadcastMatchUpdate(matchId, updated);
-                }
-                case "FORFEIT" -> {
-                    UUID matchId = uuid(payload.get("matchId"));
-                    long revision = ((Number) payload.get("revision")).longValue();
-                    UUID key = payload.containsKey("key") ? uuid(payload.get("key")) : id();
-                    Object updated = matchService.command(actor.userId(), matchId, key, revision, "FORFEIT", null);
-                    broadcastMatchUpdate(matchId, updated);
-                }
-                case "REACTION", "SEND_REACTION" -> {
-                    String roomId = Objects.toString(payload.get("roomId"), "");
-                    String body = Objects.toString(payload.get("body"), "");
-                    if (!roomId.isBlank() && !body.isBlank()) {
-                        var userRow = db.one("SELECT display_name FROM users WHERE id=?", actor.userId());
-                        String senderName = userRow != null ? Objects.toString(userRow.get("display_name"), "Player") : "Player";
-                        Map<String, Object> reactionEvent = Map.of(
-                            "type", "REACTION",
-                            "event", "reaction",
-                            "roomId", roomId,
-                            "senderId", actor.userId().toString(),
-                            "senderName", senderName,
-                            "body", body,
-                            "timestamp", System.currentTimeMillis()
-                        );
-                        // Broadcast via Redis Pub/Sub so all clustered nodes receive it
-                        realtime.publishRoomEvent(roomId, reactionEvent);
-                    }
-                }
-                case "VOICE_SIGNAL", "SIGNAL" -> {
-                    String recipientStr = Objects.toString(payload.get("recipient"), "");
-                    if (!recipientStr.isBlank()) {
-                        UUID recipient = uuid(recipientStr);
-                        Map<String, Object> signalMsg = Map.of(
-                            "type", "VOICE_SIGNAL",
-                            "event", "voice_signal",
-                            "sender", actor.userId().toString(),
-                            "signal", payload.get("signal")
-                        );
-                        // Publish through Redis Pub/Sub directly to recipient user channel
-                        realtime.publishUserEvent(recipient, signalMsg);
-                    }
-                }
-                case "PING", "HEARTBEAT" -> {
-                    realtime.setPresence(actor.userId(), "ACTIVE", null);
-                    send(session, Map.of(
-                        "type", "PONG",
-                        "event", "pong",
-                        "serverTimeMs", System.currentTimeMillis()
-                    ));
-                    db.update("UPDATE users SET connected_until=now()+interval '2 minutes' WHERE id=?", actor.userId());
-                }
-                default -> log.debug("Unknown websocket message type: {}", type);
-            }
-        } catch (Exception e) {
-            log.warn("Error handling websocket message: {}", e.getMessage());
-            send(session, Map.of("type", "ERROR", "event", "error", "message", e.getMessage()));
-        }
+    // Compatibility subscriptions are authorized; personalized snapshots never share host-only data.
+    case "SUBSCRIBE_ROOM" -> {
+     UUID room=uuid(frame.get("roomId"));require(!db.rows("SELECT 1 FROM room_members WHERE room_id=? AND user_id=?",room,client.actor.userId()).isEmpty(),403,"NOT_A_MEMBER");
+     synchronized(client){client.room=room;snapshot(client,true);}
     }
-
-    @Override
-    public void afterConnectionClosed(WebSocketSession session, CloseStatus status) {
-        Actor actor = (Actor) session.getAttributes().get("actor");
-        if (actor != null) {
-            Set<WebSocketSession> sessions = userSessions.get(actor.userId());
-            if (sessions != null) {
-                sessions.remove(session);
-                if (sessions.isEmpty()) {
-                    userSessions.remove(actor.userId());
-                    realtime.removePresence(actor.userId());
-                }
-            }
-        }
-        roomSubscriptions.values().forEach(set -> set.remove(session));
-        matchSubscriptions.values().forEach(set -> set.remove(session));
+    case "SUBSCRIBE_MATCH" -> {
+     UUID match=uuid(frame.get("matchId"));require(!db.rows("SELECT 1 FROM match_players WHERE match_id=? AND user_id=?",match,client.actor.userId()).isEmpty(),403,"NOT_A_PLAYER");snapshot(client,true);
     }
-
-    @Override
-    public void broadcastMatchUpdate(UUID matchId, Object snapshot) {
-        String key = matchId.toString();
-        // Cache snapshot in Redis
-        realtime.cacheMatchSnapshot(matchId, snapshot);
-
-        Map<String, Object> msg = Map.of(
-            "type", "MATCH_UPDATE",
-            "event", "match_update",
-            "matchId", key,
-            "data", snapshot
-        );
-        // Publish via Redis Pub/Sub
-        realtime.publishMatchEvent(key, msg);
-    }
-
-    @Override
-    public void broadcastRoomUpdate(UUID roomId, Object snapshot) {
-        String key = roomId.toString();
-        realtime.cacheRoomState(roomId, snapshot);
-
-        Map<String, Object> msg = Map.of(
-            "type", "ROOM_UPDATE",
-            "event", "room_update",
-            "roomId", key,
-            "data", snapshot
-        );
-        realtime.publishRoomEvent(key, msg);
-    }
-
-    private void ensureRedisRoomSubscription(String roomId) {
-        String topic = "ludo:channel:room:" + roomId;
-        if (subscribedRedisTopics.add(topic)) {
-            realtime.subscribe(topic, jsonMessage -> {
-                Set<WebSocketSession> subscribers = roomSubscriptions.get(roomId);
-                if (subscribers != null) {
-                    broadcastLocalText(subscribers, jsonMessage);
-                }
-            });
-        }
-    }
-
-    private void ensureRedisMatchSubscription(String matchId) {
-        String topic = "ludo:channel:match:" + matchId;
-        if (subscribedRedisTopics.add(topic)) {
-            realtime.subscribe(topic, jsonMessage -> {
-                Set<WebSocketSession> subscribers = matchSubscriptions.get(matchId);
-                if (subscribers != null) {
-                    broadcastLocalText(subscribers, jsonMessage);
-                }
-            });
-        }
-    }
-
-    private void ensureRedisUserSubscription(UUID userId) {
-        String topic = "ludo:channel:user:" + userId;
-        if (subscribedRedisTopics.add(topic)) {
-            realtime.subscribe(topic, jsonMessage -> {
-                Set<WebSocketSession> sessions = userSessions.get(userId);
-                if (sessions != null) {
-                    broadcastLocalText(sessions, jsonMessage);
-                }
-            });
-        }
-    }
-
-    private void broadcastLocalText(Set<WebSocketSession> sessions, String rawJson) {
-        TextMessage text = new TextMessage(rawJson);
-        for (WebSocketSession s : sessions) {
-            if (s.isOpen()) {
-                try {
-                    s.sendMessage(text);
-                } catch (Exception ignored) {}
-            }
-        }
-    }
-
-    private void send(WebSocketSession session, Object payload) {
-        if (session.isOpen()) {
-            try {
-                session.sendMessage(new TextMessage(db.encode(payload)));
-            } catch (IOException e) {
-                log.warn("Failed to send websocket message: {}", e.getMessage());
-            }
-        }
-    }
+    default -> throw new ApiError(400,"UNKNOWN_MESSAGE");
+   }
+  }catch(ApiError e){error(client,requestId,e.status,e.code);if(e.status==401)close(client);}
+   catch(IllegalArgumentException|NullPointerException e){error(client,requestId,400,"INVALID_REQUEST");}
+   catch(Exception e){error(client,requestId,503,"SERVICE_UNAVAILABLE");}
+ }
+ private void error(Client c,String id,int status,String code){try{send(c,Map.of("type","ERROR","requestId",id,"status",status,"code",code));}catch(Exception ignored){close(c);}}
+ private void snapshot(Client client,boolean force)throws Exception{
+  synchronized(client){
+   if(!client.session.isOpen())return;require(identity.valid(client.actor),401,"AUTHENTICATION_REQUIRED");
+   var value=new LinkedHashMap<String,Object>((Map<String,Object>)online.snapshot(client.actor.userId(),client.room));
+   if(value.get("room") instanceof Map<?,?> room)client.room=uuid(room.get("id"));
+   var comparison=new LinkedHashMap<>(value);comparison.remove("serverTimeMs");
+   // Match views contain their own observation timestamp, which is not a state change.
+   if(comparison.get("match") instanceof Map<?,?> m){var match=new LinkedHashMap<>(m);match.remove("serverTimeMs");comparison.put("match",match);}
+   String fingerprint=db.encode(comparison);if(!force&&fingerprint.equals(client.fingerprint))return;
+   client.fingerprint=fingerprint;
+   send(client,Map.of("type","SNAPSHOT","sequence",++client.sequence,"data",value));
+  }
+ }
+ private void send(Client client,Object value)throws Exception{if(client.session.isOpen())client.session.sendMessage(new TextMessage(db.encode(value)));}
+ private void close(Client client){clients.remove(client.session.getId());try{client.session.close(CloseStatus.NORMAL);}catch(Exception ignored){}}
+ @Override public void afterConnectionClosed(WebSocketSession session,CloseStatus status){clients.remove(session.getId());}
+ @Override public void handleTransportError(WebSocketSession session,Throwable error){var client=clients.remove(session.getId());if(client!=null)close(client);}
+ // Older MatchService integrations can request a refresh; committed Store changes own publication.
+ public void broadcastMatchUpdate(UUID match,Object snapshot){}
+ public void broadcastRoomUpdate(UUID room,Object snapshot){}
+ @PreDestroy void stop(){clients.values().forEach(this::close);dispatch.shutdownNow();writers.shutdownNow();}
 }

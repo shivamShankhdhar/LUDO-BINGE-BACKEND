@@ -27,7 +27,7 @@ public class OnlineController {
  private final String turnUrls,turnSecret;
  private final ExecutorService streams=Executors.newVirtualThreadPerTaskExecutor();
  private final Map<UUID,SseEmitter> connections=new ConcurrentHashMap<>();
- public static final Set<String> MESSAGES=Set.of("Good luck!","Nice move!","Well played!","One more game?","Thanks!","Oops!","😂","👏","🔥","😮","🎉","🍀");
+ public static final Set<String> MESSAGES=Set.of("Good luck!","Nice move!","Well played!","One more game?","Thanks!","Oops!","Hurry up!","😂","👏","🔥","😮","🎉","🍀","👍","❤️","😭","😎","🙏","😱","🤔","😡","👑","🎲","☠️");
  public OnlineController(Store db,RoomService rooms,MatchService matches,MatchmakingService queue,IdentityService identity,
   @Value("${ludo.turn.urls:}")String turnUrls,@Value("${ludo.turn.secret:}")String turnSecret){this.db=db;this.rooms=rooms;this.matches=matches;this.queue=queue;this.identity=identity;this.turnUrls=turnUrls;this.turnSecret=turnSecret;}
  private UUID user(Authentication auth){return ((Actor)auth.getPrincipal()).userId();}
@@ -42,7 +42,7 @@ public class OnlineController {
  @PostMapping("/rooms/{room}/configure") Object configure(Authentication auth,@PathVariable UUID room,@RequestHeader("Idempotency-Key") UUID key,@Valid @RequestBody Configure body){UUID u=user(auth);return db.mutate(u,key,"configure:"+room,body,()->rooms.configure(u,room,body.count(),body.revision()));}
 
  /** Complete snapshots are the replay boundary: reconnect never depends on a lost incremental event. */
- private Object snapshot(UUID u,UUID requestedRoom){return db.readSnapshot(()->{
+ public Object snapshot(UUID u,UUID requestedRoom){return db.readSnapshot(()->{
   var result=new LinkedHashMap<String,Object>();result.put("user",identity.profile(u));result.put("queue",queue.ticket(u));
   var allocation=db.rows("SELECT resource_id FROM user_allocations WHERE user_id=? AND kind='ROOM'",u);
   UUID room=allocation.isEmpty()?requestedRoom:uuid(allocation.getFirst().get("resource_id"));
@@ -79,9 +79,11 @@ public class OnlineController {
  public record Message(@NotBlank @Size(max=80) String body){}
  @PostMapping("/rooms/{room}/messages") Object message(Authentication auth,@PathVariable UUID room,@RequestHeader("Idempotency-Key") UUID key,@Valid @RequestBody Message body){UUID u=user(auth);db.limit("chat:"+u,8,10);return db.mutate(u,key,"message:"+room,body,()->{communicable(u,room);require(MESSAGES.contains(body.body()),400,"UNKNOWN_MESSAGE");db.update("INSERT INTO room_messages(room_id,user_id,kind,body) VALUES (?,?,'QUICK',?)",room,u,body.body());return Map.of("sent",true);});}
  @PostMapping("/rooms/{room}/voice/join") Object voiceJoin(Authentication auth,@PathVariable UUID room){UUID u=user(auth);communicable(u,room);require(!turnUrls.isBlank()&&!turnSecret.isBlank(),503,"VOICE_NOT_CONFIGURED");
+  Long signalCursor=db.jdbc.queryForObject("SELECT COALESCE(max(id),0) FROM voice_signals WHERE room_id=? AND recipient=?",Long.class,room,u);
   db.update("INSERT INTO voice_members VALUES (?,?,now()+interval '20 seconds') ON CONFLICT(room_id,user_id) DO UPDATE SET expires_at=excluded.expires_at",room,u);
   try{String username=(System.currentTimeMillis()/1000+3600)+":"+u;Mac mac=Mac.getInstance("HmacSHA1");mac.init(new SecretKeySpec(turnSecret.getBytes(StandardCharsets.UTF_8),"HmacSHA1"));String credential=Base64.getEncoder().encodeToString(mac.doFinal(username.getBytes(StandardCharsets.UTF_8)));
-   return Map.of("iceServers",List.of(Map.of("urls",Arrays.asList(turnUrls.split(",")),"username",username,"credential",credential)));
+   return Map.of("iceServers",List.of(Map.of("urls",Arrays.asList(turnUrls.split(",")),"username",username,"credential",credential)),
+    "signalCursor",signalCursor);
   }catch(java.security.GeneralSecurityException e){throw new IllegalStateException(e);}
  }
  @PostMapping("/rooms/{room}/voice/heartbeat") Object voiceHeartbeat(Authentication auth,@PathVariable UUID room){UUID u=user(auth);communicable(u,room);db.update("UPDATE voice_members SET expires_at=now()+interval '20 seconds' WHERE room_id=? AND user_id=?",room,u);return Map.of("ok",true);}

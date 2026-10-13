@@ -75,9 +75,7 @@ public final class GameEngine {
   players.set(s.active(),new Player(p.userId(),p.pawns(),p.captured(),p.forfeited(),missed));
   s=new State(s.count(),s.ruleset(),players,s.active(),s.turnId(),s.phase(),s.dice(),s.sixes(),s.winner(),s.checkpoint());
   if(missed>=3)return new Transition(forfeit(s,s.active()),List.of(),List.of("TIMEOUT_FORFEIT"));
-  Transition result=s.phase().equals("WAITING_ROLL")?roll(s,dice):move(s,legal(s,s.dice()).getFirst());
-  // Resolve a timeout roll's move in the same system action, counting one missed turn.
-  if(result.state().phase().equals("WAITING_MOVE"))result=move(result.state(),legal(result.state(),result.state().dice()).getFirst());
-  return new Transition(result.state(),result.path(),List.of("TIMEOUT_ACTION"));
+  // A missed deadline skips the turn; it never rolls dice or moves a pawn for a human.
+  return new Transition(advance(s,s.players(),false,0),List.of(),List.of("TURN_SKIPPED"));
  }
 }

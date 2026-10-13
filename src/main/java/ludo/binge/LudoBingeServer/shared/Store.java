@@ -20,7 +20,25 @@ public class Store {
  public <T>T tx(Supplier<T> work) { return transactions.execute(s->work.get()); }
  public List<Map<String,Object>> rows(String sql,Object...args) { return jdbc.queryForList(sql,args); }
  public Map<String,Object> one(String sql,Object...args) { var rows=rows(sql,args);ApiError.require(!rows.isEmpty(),404,"NOT_FOUND");return rows.getFirst(); }
- public int update(String sql,Object...args) { return jdbc.update(sql,args); }
+ private final java.util.List<Runnable> changeListeners=new java.util.concurrent.CopyOnWriteArrayList<>();
+ public void onCommittedChange(Runnable listener){changeListeners.add(listener);}
+ private final Object changeKey=new Object();
+ private void changed(){
+  if(org.springframework.transaction.support.TransactionSynchronizationManager.isSynchronizationActive()){
+   if(org.springframework.transaction.support.TransactionSynchronizationManager.hasResource(changeKey))return;
+   org.springframework.transaction.support.TransactionSynchronizationManager.bindResource(changeKey,Boolean.TRUE);
+   org.springframework.transaction.support.TransactionSynchronizationManager.registerSynchronization(new org.springframework.transaction.support.TransactionSynchronization(){
+    public void afterCommit(){publishChange();}
+    public void afterCompletion(int status){org.springframework.transaction.support.TransactionSynchronizationManager.unbindResourceIfPossible(changeKey);}
+   });
+  }else publishChange();
+ }
+ private void publishChange(){for(var listener:changeListeners)try{listener.run();}catch(RuntimeException ignored){}}
+ public int update(String sql,Object...args) {
+  int affected=jdbc.update(sql,args);
+  if(affected>0&&sql.toLowerCase(java.util.Locale.ROOT).matches("(?s)^(insert into|update|delete from) (rooms|room_members|join_requests|queue_tickets|proposals|matches|room_messages|voice_members|voice_signals)\\b.*"))changed();
+  return affected;
+ }
  public String encode(Object value) { return json.writeValueAsString(value); }
  public <T>T decode(Object value,Class<T> type) { return json.readValue(value.toString(),type); }
  public static UUID id() { return UUID.randomUUID(); }

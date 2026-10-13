@@ -63,7 +63,7 @@ public class MatchService {
   var event=new LinkedHashMap<String,Object>();event.put("effects",transition.effects());event.put("path",transition.path());event.put("dice",rolled);event.put("revision",revision);
   db.update("UPDATE matches SET snapshot=?::jsonb,revision=?,status=?,deadline=now()+interval '45 seconds',finished_at=CASE WHEN ? THEN now() ELSE NULL END WHERE id=?",db.encode(state),revision,state.phase().equals("FINISHED")?"FINISHED":"PLAYING",state.phase().equals("FINISHED"),match);
   db.update("INSERT INTO game_events(match_id,seq,event_id,payload) VALUES (?,?,?,?::jsonb)",match,revision,id(),db.encode(event));
-  if(notifier!=null){try{notifier.broadcastMatchUpdate(match,view(db.one("SELECT * FROM matches WHERE id=?",match)));}catch(Exception ignored){}}
+
   if(state.phase().equals("FINISHED")){
    db.update("UPDATE rooms SET phase='FINISHED',revision=revision+1 WHERE id=?",room);db.update("DELETE FROM user_allocations WHERE resource_id=?",room);
    for(var player:state.players())if(db.update("INSERT INTO result_applications(match_id,user_id) VALUES (?,?) ON CONFLICT DO NOTHING",match,uuid(player.userId()))==1)

@@ -37,4 +37,11 @@ class GameEngineTests {
   assertEquals(83,engine.finish(s));assertEquals(65,engine.global(s,0,0));assertEquals(52,engine.global(s,5,0));
   assertEquals(-1,engine.global(s,0,77));
  }
+
+ @Test void missedTurnNeverRollsOrMovesForHuman(){
+  var state=engine.initial(List.of("a","b"));var timeout=engine.timeout(state,6);
+  assertEquals(state.players().getFirst().pawns(),timeout.state().players().getFirst().pawns());
+  assertEquals(1,timeout.state().active());assertNull(timeout.state().dice());
+  assertEquals(List.of("TURN_SKIPPED"),timeout.effects());assertNull(timeout.state().winner());
+ }
 }

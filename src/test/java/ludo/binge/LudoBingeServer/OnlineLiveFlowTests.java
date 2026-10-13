@@ -20,7 +20,8 @@ import static org.junit.jupiter.api.Assertions.*;
 
 /** Authenticated HTTP/SSE integration against an isolated disposable PostgreSQL database. */
 @SpringBootTest(webEnvironment=SpringBootTest.WebEnvironment.RANDOM_PORT, properties={
- "spring.config.import=", "ludo.workers.enabled=false"
+ "spring.config.import=", "ludo.workers.enabled=false",
+ "ludo.turn.urls=turn:turn.example.test:3478", "ludo.turn.secret=isolated-test-secret"
 })
 @org.springframework.test.annotation.DirtiesContext(classMode=org.springframework.test.annotation.DirtiesContext.ClassMode.AFTER_CLASS)
 @org.springframework.test.context.TestExecutionListeners(listeners=OnlineLiveFlowTests.Cleanup.class,
@@ -116,5 +117,93 @@ class OnlineLiveFlowTests {
    assertEquals(aMove.get("state"),bMove.get("state"));
    assertEquals(map(aMove.get("lastEvent")).get("dice"),map(bMove.get("lastEvent")).get("dice"));
   }
+ }
+
+ class SocketClient implements AutoCloseable, WebSocket.Listener {
+  final java.util.concurrent.BlockingQueue<Map<?,?>> frames=new java.util.concurrent.LinkedBlockingQueue<>();
+  final StringBuilder buffer=new StringBuilder();
+  final HttpClient http=HttpClient.newHttpClient();final WebSocket socket;
+  SocketClient(Player player){
+   socket=http.newWebSocketBuilder().header("Authorization","Bearer "+player.token())
+    .buildAsync(URI.create("ws://localhost:"+port+"/ws/online"),this).join();
+  }
+  public void onOpen(WebSocket socket){socket.request(1);}
+  public java.util.concurrent.CompletionStage<?> onText(WebSocket socket,CharSequence data,boolean last){
+   buffer.append(data);if(last){frames.add(db.decode(buffer.toString(),Map.class));buffer.setLength(0);}socket.request(1);return null;
+  }
+  Map<?,?> until(Predicate<Map<?,?>> predicate)throws Exception{
+   long end=System.nanoTime()+java.util.concurrent.TimeUnit.SECONDS.toNanos(5);
+   while(System.nanoTime()<end){var value=frames.poll(Math.max(1,end-System.nanoTime()),java.util.concurrent.TimeUnit.NANOSECONDS);assertNotNull(value,"WebSocket event not delivered");if(predicate.test(value))return value;}
+   throw new AssertionError("WebSocket event not delivered");
+  }
+  Map<?,?> request(String path,Map<?,?> body,UUID key)throws Exception{
+   String request=id().toString();socket.sendText(db.encode(Map.of("type","REQUEST","requestId",request,"key",key,"path",path,"body",body)),true).join();
+   var frame=until(f->request.equals(f.get("requestId")));assertEquals("ACK",frame.get("type"),frame.toString());return map(frame.get("data"));
+  }
+  Map<?,?> snapshot(Predicate<Map<?,?>> predicate)throws Exception{return map(until(f->"SNAPSHOT".equals(f.get("type"))&&predicate.test(map(f.get("data")))).get("data"));}
+  public void close(){socket.abort();http.close();}
+ }
+ @Test void socketDeliversPrivateApprovalAndChatWithoutHttpPolling()throws Exception{
+  var host=player("Socket Host");var guest=player("Socket Guest");
+  try(var h=new SocketClient(host);var g=new SocketClient(guest)){
+   h.snapshot(s->true);g.snapshot(s->true);
+   var created=h.request("/rooms",Map.of("count",2),id());String room=map(created.get("room")).get("id").toString();
+   g.request("/rooms/join",Map.of("code",map(created.get("invite")).get("code")),id());
+   var hostState=h.snapshot(s->s.get("room") instanceof Map<?,?> r && r.get("joinRequests") instanceof List<?> requests&&!requests.isEmpty());
+   var hostRoom=map(hostState.get("room"));var request=map(((List<?>)hostRoom.get("joinRequests")).getFirst());
+   h.request("/rooms/"+room+"/requests/"+request.get("id"),Map.of("accept",true,"revision",hostRoom.get("revision")),id());
+   var guestState=g.snapshot(s->s.get("room") instanceof Map<?,?> r&&room.equals(r.get("id")));
+   assertFalse(map(guestState.get("room")).containsKey("joinRequests"));
+   g.request("/rooms/"+room+"/messages",Map.of("body","🔥"),id());
+   var chat=h.snapshot(s->s.get("messages") instanceof List<?> m&&!m.isEmpty());
+   assertEquals("🔥",map(((List<?>)chat.get("messages")).getFirst()).get("body"));
+   var hostVoice=h.request("/rooms/"+room+"/voice/join",Map.of(),id());
+   assertFalse(((List<?>)hostVoice.get("iceServers")).isEmpty());
+   var guestVoice=g.request("/rooms/"+room+"/voice/join",Map.of(),id());
+   h.request("/rooms/"+room+"/voice/signal",Map.of("recipient",guest.id(),"type","offer","data","test-sdp"),id());
+   var signal=g.snapshot(s->s.get("signals") instanceof List<?> signals&&!signals.isEmpty());
+   var delivered=map(((List<?>)signal.get("signals")).getFirst());
+   assertEquals("test-sdp",map(delivered.get("payload")).get("data"));
+   assertTrue(((Number)delivered.get("id")).longValue()>((Number)guestVoice.get("signalCursor")).longValue());
+
+  }
+ }
+ @Test void socketAcceptanceCommandsAndReconnectAreAuthoritative()throws Exception{
+  var a=player("Socket A");var b=player("Socket B");
+  try(var x=new SocketClient(a);var y=new SocketClient(b)){
+   x.request("/matchmaking/tickets",Map.of("count",2),id());y.request("/matchmaking/tickets",Map.of("count",2),id());
+   new MatchmakingService(db,new ludo.binge.LudoBingeServer.room.RoomService(db,""),true).tick();
+   var found=x.snapshot(s->s.get("queue") instanceof Map<?,?> q&&"RESERVED".equals(q.get("status")));
+   var accept=Map.of("proposalId",map(map(found.get("queue")).get("proposal")).get("id"));
+   x.request("/matchmaking/accept",accept,id());y.request("/matchmaking/accept",accept,id());
+   var countdown=x.snapshot(s->s.get("room") instanceof Map<?,?> r&&"COUNTDOWN".equals(r.get("phase")));
+   String room=map(countdown.get("room")).get("id").toString();
+   db.update("UPDATE rooms SET countdown_at=now()-interval '1 second' WHERE id=?",uuid(room));new MatchService(db,true).tick();
+   var started=x.snapshot(s->s.get("match") instanceof Map<?,?> m&&Boolean.TRUE.equals(m.get("active")));
+   var match=map(started.get("match"));assertEquals("WAITING_ROLL",map(match.get("state")).get("phase"));
+   String path="/matches/"+match.get("matchId")+"/commands";UUID key=id();var command=Map.of("action","ROLL","revision",match.get("revision"));
+   var rolled=x.request(path,command,key);var retry=x.request(path,command,key);assertEquals(rolled.get("revision"),retry.get("revision"));
+   var remote=y.snapshot(s->s.get("match") instanceof Map<?,?> m&&m.get("revision") instanceof Number revision&&revision.longValue()==1);
+   assertEquals(rolled.get("state"),map(remote.get("match")).get("state"));
+   try(var reconnected=new SocketClient(b)){
+    var recovered=reconnected.snapshot(s->s.get("match") instanceof Map<?,?> m&&match.get("matchId").equals(m.get("matchId")));
+    assertEquals(rolled.get("state"),map(recovered.get("match")).get("state"));
+   }
+  }
+ }
+ @Test void socketRejectsRoomEavesdroppingAndCrossRoomVoice()throws Exception{
+  var host=player("Private");var stranger=player("Stranger");var created=call(host,"/rooms",Map.of("count",2));String room=map(created.get("room")).get("id").toString();
+  try(var client=new SocketClient(stranger)){
+   client.socket.sendText(db.encode(Map.of("type","SUBSCRIBE_ROOM","roomId",room)),true).join();
+   assertEquals("NOT_A_MEMBER",client.until(f->"ERROR".equals(f.get("type"))).get("code"));
+   String request=id().toString();client.socket.sendText(db.encode(Map.of("type","REQUEST","requestId",request,"key",id(),"path","/rooms/"+room+"/voice/signal","body",Map.of("recipient",host.id(),"type","offer","data","fake-sdp"))),true).join();
+   assertEquals("NOT_A_MEMBER",client.until(f->request.equals(f.get("requestId"))).get("code"));
+  }
+ }
+ @Test void rolledBackRoomChangesAreNotPublished(){
+  var changes=new java.util.concurrent.atomic.AtomicInteger();db.onCommittedChange(changes::incrementAndGet);
+  var user=player("Rollback");
+  assertThrows(IllegalStateException.class,()->db.tx(()->{new ludo.binge.LudoBingeServer.room.RoomService(db,"").create(user.id(),2);throw new IllegalStateException("rollback");}));
+  assertEquals(0,changes.get());
  }
 }

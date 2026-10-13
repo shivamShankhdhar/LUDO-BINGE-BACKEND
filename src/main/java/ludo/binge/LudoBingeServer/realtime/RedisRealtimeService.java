@@ -58,7 +58,7 @@ public class RedisRealtimeService {
                 try {
                     template = new StringRedisTemplate(factory);
                     // Quick ping test
-                    template.getConnectionFactory().getConnection().ping();
+                    try(var connection=template.getConnectionFactory().getConnection()){connection.ping();}
                     container = new RedisMessageListenerContainer();
                     container.setConnectionFactory(factory);
                     container.afterPropertiesSet();
@@ -66,14 +66,13 @@ public class RedisRealtimeService {
                     active = true;
                     log.info("Redis real-time state & pub/sub connected successfully.");
                 } catch (Exception e) {
-                    log.warn("Redis ping failed ({}), gracefully defaulting to high-speed in-memory state store.", e.getMessage());
-                    template = null;
-                    container = null;
-                    active = false;
+                    if(container!=null)try{container.destroy();}catch(Exception cleanup){e.addSuppressed(cleanup);}
+                    throw new IllegalStateException("Redis is enabled but unavailable; refusing isolated realtime operation",e);
                 }
             }
         }
 
+        if(redisEnabled && !active)throw new IllegalStateException("Redis is enabled but no connection factory is available");
         this.redisEnabled = active;
         this.redisTemplate = template;
         this.listenerContainer = container;
@@ -180,7 +179,7 @@ public class RedisRealtimeService {
         publish(TOPIC_PREFIX_USER + userId, store.encode(payload));
     }
 
-    private void publish(String topic, String message) {
+    public void publish(String topic, String message) {
         if (redisEnabled && redisTemplate != null) {
             try {
                 redisTemplate.convertAndSend(topic, message);
@@ -222,6 +221,9 @@ public class RedisRealtimeService {
             }
         }
     }
+
+    @jakarta.annotation.PreDestroy
+    void close() throws Exception {if(listenerContainer!=null)listenerContainer.destroy();}
 
     public boolean isRedisActive() {
         return redisEnabled;
