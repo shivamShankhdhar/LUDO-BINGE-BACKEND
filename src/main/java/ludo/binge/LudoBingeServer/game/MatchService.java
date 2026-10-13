@@ -46,7 +46,13 @@ public class MatchService {
     if(action.equals("ROLL")){rolled=random.nextInt(6)+1;transition=engine.roll(state,rolled);}
     else {require(action.equals("MOVE")&&pawn!=null,400,"INVALID_COMMAND");transition=engine.move(state,pawn);}
    }
-   save(row,transition,rolled);return view(db.one("SELECT * FROM matches WHERE id=?",match));
+   save(row,transition,rolled);
+   if(action.equals("FORFEIT")){
+    db.update("DELETE FROM user_allocations WHERE user_id=? AND resource_id=?",user,row.get("room_id"));
+    db.update("DELETE FROM voice_members WHERE user_id=? AND room_id=?",user,row.get("room_id"));
+    db.update("DELETE FROM room_members WHERE user_id=? AND room_id=?",user,row.get("room_id"));
+   }
+   return view(db.one("SELECT * FROM matches WHERE id=?",match));
   });
  }
  private void save(Map<String,Object> row,GameEngine.Transition transition,Integer rolled){

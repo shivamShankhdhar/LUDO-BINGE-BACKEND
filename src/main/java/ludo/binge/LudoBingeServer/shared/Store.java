@@ -14,7 +14,9 @@ public class Store {
  public final JdbcTemplate jdbc;
  public final ObjectMapper json;
  private final TransactionTemplate transactions;
- public Store(JdbcTemplate jdbc,ObjectMapper json,PlatformTransactionManager manager) { this.jdbc=jdbc;this.json=json;transactions=new TransactionTemplate(manager);transactions.setTimeout(10); }
+ private final TransactionTemplate snapshots;
+ public Store(JdbcTemplate jdbc,ObjectMapper json,PlatformTransactionManager manager) { this.jdbc=jdbc;this.json=json;transactions=new TransactionTemplate(manager);transactions.setTimeout(10);snapshots=new TransactionTemplate(manager);snapshots.setReadOnly(true);snapshots.setIsolationLevel(org.springframework.transaction.TransactionDefinition.ISOLATION_REPEATABLE_READ);snapshots.setTimeout(10); }
+ public <T>T readSnapshot(Supplier<T> work) { return snapshots.execute(s->work.get()); }
  public <T>T tx(Supplier<T> work) { return transactions.execute(s->work.get()); }
  public List<Map<String,Object>> rows(String sql,Object...args) { return jdbc.queryForList(sql,args); }
  public Map<String,Object> one(String sql,Object...args) { var rows=rows(sql,args);ApiError.require(!rows.isEmpty(),404,"NOT_FOUND");return rows.getFirst(); }

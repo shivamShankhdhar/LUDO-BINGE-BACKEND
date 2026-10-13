@@ -19,7 +19,7 @@ public class SecurityConfiguration {
   var bearer=new OncePerRequestFilter(){
    protected void doFilterInternal(HttpServletRequest request,HttpServletResponse response,FilterChain chain)throws ServletException,IOException {
     String uri=request.getRequestURI();
-    if(uri.startsWith("/api/v1/auth/")||uri.equals("/api/v1/capabilities")||uri.equals("/api/v1/config")||uri.startsWith("/actuator/")||uri.equals("/error")||uri.startsWith("/r/")){
+    if((uri.startsWith("/api/v1/auth/")&&!uri.equals("/api/v1/auth/logout"))||uri.equals("/api/v1/capabilities")||uri.equals("/api/v1/config")||uri.startsWith("/actuator/")||uri.equals("/error")||uri.startsWith("/r/")){
      chain.doFilter(request,response);
      return;
     }
@@ -35,6 +35,8 @@ public class SecurityConfiguration {
    .addFilterBefore(bearer,UsernamePasswordAuthenticationFilter.class)
    .authorizeHttpRequests(a->a
     .requestMatchers(org.springframework.http.HttpMethod.GET,"/api/v1/capabilities","/api/v1/config","/actuator/health","/actuator/health/**","/r/**").permitAll()
+    .dispatcherTypeMatchers(jakarta.servlet.DispatcherType.ASYNC).permitAll()
+    .requestMatchers("/api/v1/auth/logout").authenticated()
     .requestMatchers("/api/v1/auth/**","/error").permitAll()
     .requestMatchers("/api/v1/**","/ws").authenticated().anyRequest().denyAll())
    .exceptionHandling(e->e.authenticationEntryPoint((req,res,error)->{res.setStatus(401);res.setContentType("application/json");res.getWriter().write("{\"code\":\"AUTHENTICATION_REQUIRED\"}");}))

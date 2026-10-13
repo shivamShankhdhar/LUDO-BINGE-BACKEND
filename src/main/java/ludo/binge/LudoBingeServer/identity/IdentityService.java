@@ -53,21 +53,22 @@ public class IdentityService {
  private Object issue(UUID user,UUID family) {
   require(!db.rows("SELECT 1 FROM users WHERE id=? AND google_sub IS NOT NULL AND status='ACTIVE'",user).isEmpty(),403,"GOOGLE_SIGN_IN_REQUIRED");
   String refresh=token(),access=token();UUID sid=id();
-  db.update("INSERT INTO refresh_sessions(id,user_id,family,token_hash,access_hash,access_expires,expires_at) VALUES (?,?,?,?,?,now()+interval '15 minutes',now()+interval '30 days')",sid,user,family,hash(refresh),hash(access));
+  db.update("INSERT INTO refresh_sessions(id,user_id,family,token_hash,access_hash,access_expires,expires_at) VALUES (?,?,?,?,?,now()+interval '15 minutes',now()+interval '90 days')",sid,user,family,hash(refresh),hash(access));
   return Map.of("accessToken",access,"refreshToken",refresh,"tokenType","Bearer","expiresIn",900,"user",profile(user));
  }
- public Object refresh(String token,String remote) {
+ public Object refresh(String token,String remote) {return refresh(token,remote,null);}
+ public Object refresh(String token,String remote,UUID retryKey) {
   db.limit("refresh:"+remote,30,60);
   Object result=db.tx(()->{
    var rows=db.rows("SELECT * FROM refresh_sessions WHERE token_hash=? AND expires_at>now() FOR UPDATE",hash(token));
    if(rows.isEmpty())return null;var old=rows.getFirst();
+   if((boolean)old.get("consumed")&&!(boolean)old.get("revoked")&&retryKey!=null&&retryKey.equals(old.get("retry_key"))&&old.get("retry_until")!=null&&((java.sql.Timestamp)old.get("retry_until")).toInstant().isAfter(java.time.Instant.now()))return db.decode(RefreshRetryCipher.decrypt(token,old.get("retry_response").toString()),Object.class);
    if((boolean)old.get("consumed")||(boolean)old.get("revoked")) {
     db.update("UPDATE refresh_sessions SET revoked=true WHERE family=?",old.get("family"));return null;
    }
    db.update("UPDATE refresh_sessions SET consumed=true,access_hash=NULL WHERE id=?",old.get("id"));
    Object issued=issue(uuid(old.get("user_id")),uuid(old.get("family")));
-   // Rotation never extends the original family's absolute lifetime.
-   db.update("UPDATE refresh_sessions SET expires_at=LEAST(expires_at,?) WHERE family=?",old.get("expires_at"),old.get("family"));
+   if(retryKey!=null)db.update("UPDATE refresh_sessions SET retry_key=?,retry_response=?,retry_until=now()+interval '30 seconds' WHERE id=?",retryKey,RefreshRetryCipher.encrypt(token,db.encode(issued)),old.get("id"));
    return issued;
   });
   require(result!=null,401,"REFRESH_EXPIRED_OR_REUSED");return result;

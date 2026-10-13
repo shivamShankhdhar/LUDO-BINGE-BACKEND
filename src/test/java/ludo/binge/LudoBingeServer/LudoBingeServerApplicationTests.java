@@ -46,6 +46,10 @@ class LudoBingeServerApplicationTests {
   assertEquals(401,response.statusCode());
   assertTrue(response.headers().firstValue("set-cookie").isEmpty());
   assertEquals(401,get("/actuator/info").statusCode());
+  assertEquals(401,get("/api/v1/live").statusCode());
+  assertEquals(401,get("/api/v1/sync").statusCode());
+  var logout=HttpRequest.newBuilder(URI.create("http://localhost:"+port+"/api/v1/auth/logout")).POST(HttpRequest.BodyPublishers.ofString("{}")).build();
+  assertEquals(401,HttpClient.newHttpClient().send(logout,HttpResponse.BodyHandlers.ofString()).statusCode());
  }
  @Test void readinessFailsWhenPostgresIsUnavailable() throws Exception {
   assertEquals(503,get("/actuator/health/readiness").statusCode());

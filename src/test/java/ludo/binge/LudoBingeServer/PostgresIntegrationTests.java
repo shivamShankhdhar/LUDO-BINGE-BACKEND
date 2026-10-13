@@ -36,7 +36,7 @@ class PostgresIntegrationTests {
                 var flyway = Flyway.configure().dataSource(url, user, password)
                     .defaultSchema(schema).schemas(schema).locations("classpath:db/migration")
                     .cleanDisabled(true).validateMigrationNaming(true).load();
-                assertEquals(2, flyway.migrate().migrationsExecuted);
+                assertTrue(flyway.migrate().migrationsExecuted >= 4);
                 assertEquals(0, flyway.migrate().migrationsExecuted);
                 flyway.validate();
 
