@@ -29,7 +29,7 @@ class GameEngineTests {
  }
  @Test void repeatedTimeoutsEventuallyFinishWithoutBots(){
   var s=engine.initial(List.of("a","b"));
-  for(int i=0;i<10&&!s.phase().equals("FINISHED");i++)s=engine.timeout(s,2).state();
+  for(int i=0;i<10&&!s.phase().equals("FINISHED");i++)s=engine.timeout(s).state();
   assertEquals("FINISHED",s.phase());assertNotNull(s.winner());
  }
  @Test void sixPlayerGeometryAndFinishAreConsistent(){
@@ -39,7 +39,7 @@ class GameEngineTests {
  }
 
  @Test void missedTurnNeverRollsOrMovesForHuman(){
-  var state=engine.initial(List.of("a","b"));var timeout=engine.timeout(state,6);
+  var state=engine.initial(List.of("a","b"));var timeout=engine.timeout(state);
   assertEquals(state.players().getFirst().pawns(),timeout.state().players().getFirst().pawns());
   assertEquals(1,timeout.state().active());assertNull(timeout.state().dice());
   assertEquals(List.of("TURN_SKIPPED"),timeout.effects());assertNull(timeout.state().winner());

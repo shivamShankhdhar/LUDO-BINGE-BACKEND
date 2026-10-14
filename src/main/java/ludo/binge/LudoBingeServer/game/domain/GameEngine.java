@@ -70,7 +70,7 @@ public final class GameEngine {
   if(remaining.size()<=1)return new State(s.count(),s.ruleset(),players,s.active(),s.turnId(),"FINISHED",null,0,remaining.isEmpty()?null:remaining.getFirst().userId());
   return seat==s.active()?advance(s,players,false,0):new State(s.count(),s.ruleset(),players,s.active(),s.turnId(),s.phase(),s.dice(),s.sixes(),s.winner(),s.checkpoint());
  }
- public Transition timeout(State s,int dice){
+ public Transition timeout(State s){
   var players=new ArrayList<>(s.players());var p=players.get(s.active());int missed=p.missedTurns()+1;
   players.set(s.active(),new Player(p.userId(),p.pawns(),p.captured(),p.forfeited(),missed));
   s=new State(s.count(),s.ruleset(),players,s.active(),s.turnId(),s.phase(),s.dice(),s.sixes(),s.winner(),s.checkpoint());

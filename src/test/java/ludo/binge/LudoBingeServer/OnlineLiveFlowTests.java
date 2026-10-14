@@ -189,6 +189,12 @@ class OnlineLiveFlowTests {
     var recovered=reconnected.snapshot(s->s.get("match") instanceof Map<?,?> m&&match.get("matchId").equals(m.get("matchId")));
     assertEquals(rolled.get("state"),map(recovered.get("match")).get("state"));
    }
+   db.update("UPDATE matches SET deadline=now()-interval '1 second' WHERE id=?",uuid(match.get("matchId")));
+   new MatchService(db,true).tick();
+   var timedOut=y.snapshot(s->s.get("match") instanceof Map<?,?> m&&m.get("revision") instanceof Number r&&r.longValue()==2);
+   var event=map(map(timedOut.get("match")).get("lastEvent"));
+   assertNull(event.get("dice"),"A timeout must not publish a random dice result");
+   assertEquals(List.of("TURN_SKIPPED"),event.get("effects"));
   }
  }
  @Test void socketRejectsRoomEavesdroppingAndCrossRoomVoice()throws Exception{

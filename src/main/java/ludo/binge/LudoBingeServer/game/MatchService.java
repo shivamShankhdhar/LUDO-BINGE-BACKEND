@@ -83,7 +83,7 @@ public class MatchService {
      db.update("UPDATE rooms SET phase='PLAYING',revision=revision+1 WHERE id=?",roomId);
     }return null;
    });
-   db.tx(()->{for(var match:db.rows("SELECT * FROM matches WHERE status='PLAYING' AND deadline<=now() ORDER BY deadline LIMIT 10 FOR UPDATE SKIP LOCKED")){var state=db.decode(match.get("snapshot"),GameEngine.State.class);int dice=random.nextInt(6)+1;save(match,engine.timeout(state,dice),dice);}return null;});
+   db.tx(()->{for(var match:db.rows("SELECT * FROM matches WHERE status='PLAYING' AND deadline<=now() ORDER BY deadline LIMIT 10 FOR UPDATE SKIP LOCKED")){var state=db.decode(match.get("snapshot"),GameEngine.State.class);save(match,engine.timeout(state),null);}return null;});
   }catch(org.springframework.dao.DataAccessException e){org.slf4j.LoggerFactory.getLogger(getClass()).warn("Match worker could not access database: {}",e.getClass().getSimpleName());}
  }
 }
