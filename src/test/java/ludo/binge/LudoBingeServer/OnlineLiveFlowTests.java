@@ -183,8 +183,12 @@ class OnlineLiveFlowTests {
    var match=map(started.get("match"));assertEquals("WAITING_ROLL",map(match.get("state")).get("phase"));
    String path="/matches/"+match.get("matchId")+"/commands";UUID key=id();var command=Map.of("action","ROLL","revision",match.get("revision"));
    var rolled=x.request(path,command,key);var retry=x.request(path,command,key);assertEquals(rolled.get("revision"),retry.get("revision"));
-   var remote=y.snapshot(s->s.get("match") instanceof Map<?,?> m&&m.get("revision") instanceof Number revision&&revision.longValue()==1);
-   assertEquals(rolled.get("state"),map(remote.get("match")).get("state"));
+   assertEquals(0, ((Number)map(rolled.get("lastEvent")).get("actorSeat")).intValue());
+   assertEquals(map(match.get("state")).get("turnId"), map(rolled.get("lastEvent")).get("turnId"));
+   var direct=y.until(f->"MATCH".equals(f.get("type"))&&
+    match.get("matchId").toString().equals(f.get("matchId"))&&
+    ((Number)map(f.get("data")).get("revision")).longValue()==1);
+   assertEquals(rolled.get("state"),map(direct.get("data")).get("state"));
    try(var reconnected=new SocketClient(b)){
     var recovered=reconnected.snapshot(s->s.get("match") instanceof Map<?,?> m&&match.get("matchId").equals(m.get("matchId")));
     assertEquals(rolled.get("state"),map(recovered.get("match")).get("state"));
@@ -195,6 +199,17 @@ class OnlineLiveFlowTests {
    var event=map(map(timedOut.get("match")).get("lastEvent"));
    assertNull(event.get("dice"),"A timeout must not publish a random dice result");
    assertEquals(List.of("TURN_SKIPPED"),event.get("effects"));
+   for(int i=0;i<8;i++){
+    var current=db.one("SELECT snapshot,revision FROM matches WHERE id=?",uuid(match.get("matchId")));
+    if("FINISHED".equals(map(db.decode(current.get("snapshot"),Map.class)).get("phase")))break;
+    db.update("UPDATE matches SET deadline=now()-interval '1 second' WHERE id=?",uuid(match.get("matchId")));
+    new MatchService(db,true).tick();
+   }
+   var finished=db.one("SELECT snapshot,revision FROM matches WHERE id=?",uuid(match.get("matchId")));
+   assertEquals("FINISHED",map(db.decode(finished.get("snapshot"),Map.class)).get("phase"));
+   var finishSnapshot=y.snapshot(s->s.get("match") instanceof Map<?,?> m&&
+    "FINISHED".equals(map(m.get("state")).get("phase")));
+   assertEquals("TIMEOUT_FORFEIT",map(map(finishSnapshot.get("match")).get("lastEvent")).get("finishReason"));
   }
  }
  @Test void socketRejectsRoomEavesdroppingAndCrossRoomVoice()throws Exception{

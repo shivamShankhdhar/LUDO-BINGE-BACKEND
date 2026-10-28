@@ -6,7 +6,7 @@ import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.web.server.LocalServerPort;
 import static org.junit.jupiter.api.Assertions.*;
 @SpringBootTest(webEnvironment=SpringBootTest.WebEnvironment.RANDOM_PORT, properties = {
- "spring.config.import=", "ludo.workers.enabled=false",
+ "spring.config.import=", "ludo.workers.enabled=false", "ludo.guest.enabled=false",
  "spring.datasource.url=jdbc:postgresql://127.0.0.1:1/unavailable_test_database",
  "spring.datasource.username=test",
  "spring.datasource.password=test",

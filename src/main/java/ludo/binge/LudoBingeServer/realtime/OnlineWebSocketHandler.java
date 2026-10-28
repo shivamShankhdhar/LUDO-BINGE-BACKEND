@@ -58,7 +58,7 @@ public class OnlineWebSocketHandler extends TextWebSocketHandler implements Real
    switch(type){
     case "PING" -> {presence(client.actor);send(client,Map.of("type","PONG","serverTimeMs",System.currentTimeMillis()));}
     case "SYNC" -> {
-     synchronized(client){String room=Objects.toString(frame.get("room"),"");client.room=room.isBlank()?null:uuid(room);snapshot(client,true);}
+     synchronized(client){String room=Objects.toString(frame.get("room"),"");UUID r=null;if(!room.isBlank()){try{r=uuid(room);}catch(Exception ignored){}}client.room=r;snapshot(client,true);}
      send(client,Map.of("type","ACK","requestId",requestId,"data",Map.of("synced",true)));
     }
     case "REQUEST" -> {
@@ -100,7 +100,19 @@ public class OnlineWebSocketHandler extends TextWebSocketHandler implements Real
  @Override public void afterConnectionClosed(WebSocketSession session,CloseStatus status){clients.remove(session.getId());}
  @Override public void handleTransportError(WebSocketSession session,Throwable error){var client=clients.remove(session.getId());if(client!=null)close(client);}
  // Older MatchService integrations can request a refresh; committed Store changes own publication.
- public void broadcastMatchUpdate(UUID match,Object snapshot){}
+ public void broadcastMatchUpdate(UUID match,Object snapshot){
+  if(snapshot==null||clients.isEmpty())return;
+  writers.submit(()->{
+   try{
+    Set<UUID> players=new HashSet<>();
+    for(var row:db.rows("SELECT user_id FROM match_players WHERE match_id=?",match))players.add(uuid(row.get("user_id")));
+    Object frame=Map.of("type","MATCH","matchId",match.toString(),"data",snapshot);
+    for(var client:clients.values())if(players.contains(client.actor.userId())){
+     try{send(client,frame);}catch(Exception e){close(client);}
+    }
+   }catch(Exception e){org.slf4j.LoggerFactory.getLogger(getClass()).warn("Match push failed for {}",match,e);}
+  });
+ }
  public void broadcastRoomUpdate(UUID room,Object snapshot){}
  @PreDestroy void stop(){clients.values().forEach(this::close);dispatch.shutdownNow();writers.shutdownNow();}
 }

@@ -13,12 +13,19 @@ public class IdentityService {
  public record Actor(UUID userId,UUID sessionId) implements java.security.Principal { public String getName(){return userId.toString();} }
  private final Store db;
  private final java.util.Set<String> clientIds;
+ private final boolean guestEnabled;
  private volatile JwtDecoder google;
- public IdentityService(Store db,@Value("${ludo.google.client-id:}") String clientId) {
+ @org.springframework.beans.factory.annotation.Autowired
+ public IdentityService(Store db,@Value("${ludo.google.client-id:}") String clientId,@Value("${ludo.guest.enabled:true}") boolean guestEnabled) {
   this.db=db;
   this.clientIds=Arrays.stream(clientId.split(",")).map(String::trim).filter(s -> !s.isEmpty()).collect(java.util.stream.Collectors.toSet());
+  this.guestEnabled=guestEnabled;
+ }
+ public IdentityService(Store db,String clientId) {
+  this(db,clientId,true);
  }
  public boolean configured(){return !clientIds.isEmpty();}
+ public boolean guestConfigured(){return guestEnabled;}
  public Object challenge(String remote) {
   db.limit("auth:"+remote,20,60); String nonce=token();UUID id=id();
   db.update("INSERT INTO auth_challenges(id,nonce_hash,expires_at) VALUES (?,?,now()+interval '5 minutes')",id,hash(nonce));
@@ -47,8 +54,21 @@ public class IdentityService {
    return issue(user,id());
   });
  }
- public Object guest(String name,String remote) {
-  throw new ApiError(403,"GOOGLE_SIGN_IN_REQUIRED");
+ public Object guest(String name,String remote) {return guest(name,null,remote);}
+ public Object guest(String name,String guestId,String remote) {
+  require(guestConfigured(),403,"GOOGLE_SIGN_IN_REQUIRED");
+  db.limit("login:"+remote,20,60);
+  return db.tx(()->{
+   String safeName = (name == null || name.isBlank()) ? "Guest" : name.trim();
+   safeName = safeName.substring(0, Math.min(safeName.length(), 40));
+   String sub = "guest-" + ((guestId != null && !guestId.isBlank()) ? guestId.trim() : UUID.nameUUIDFromBytes(safeName.toLowerCase().getBytes()).toString());
+   UUID user = db.jdbc.queryForObject(
+     "INSERT INTO users(id,google_sub,display_name,avatar_url) VALUES (?,?,?,NULL) ON CONFLICT(google_sub) DO UPDATE SET display_name=excluded.display_name,updated_at=now() RETURNING id",
+     UUID.class, id(), sub, safeName
+   );
+   require(db.one("SELECT status FROM users WHERE id=?",user).get("status").equals("ACTIVE"),403,"ACCOUNT_UNAVAILABLE");
+   return issue(user, id());
+  });
  }
  private Object issue(UUID user,UUID family) {
   require(!db.rows("SELECT 1 FROM users WHERE id=? AND google_sub IS NOT NULL AND status='ACTIVE'",user).isEmpty(),403,"GOOGLE_SIGN_IN_REQUIRED");

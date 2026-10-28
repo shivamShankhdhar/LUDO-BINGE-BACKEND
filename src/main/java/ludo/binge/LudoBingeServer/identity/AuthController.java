@@ -9,8 +9,8 @@ import org.springframework.web.bind.annotation.*;
 public class AuthController {
  private final IdentityService identity;
  public AuthController(IdentityService identity){this.identity=identity;}
- public record Guest(@NotBlank @Size(max=40) String displayName){}
- @PostMapping("/auth/guest") Object guest(@Valid @RequestBody Guest body,HttpServletRequest request){return identity.guest(body.displayName(),request.getRemoteAddr());}
+ public record Guest(@NotBlank @Size(max=40) String displayName, String guestId){}
+ @PostMapping("/auth/guest") Object guest(@Valid @RequestBody Guest body,HttpServletRequest request){return identity.guest(body.displayName(),body.guestId(),request.getRemoteAddr());}
  public record Login(@NotNull UUID challengeId,@NotBlank @Size(max=16384) String idToken){}
  public record Refresh(@NotBlank @Size(max=512) String refreshToken,UUID requestId){}
  @PostMapping("/auth/challenge") Object challenge(HttpServletRequest request){return identity.challenge(request.getRemoteAddr());}

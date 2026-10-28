@@ -10,5 +10,5 @@ public class CapabilitiesController {
  @org.springframework.beans.factory.annotation.Value("${ludo.turn.urls:}") private String turnUrls;
  @org.springframework.beans.factory.annotation.Value("${ludo.turn.secret:}") private String turnSecret;
  public CapabilitiesController(IdentityService identity){this.identity=identity;}
- @GetMapping({"/api/v1/capabilities","/api/v1/config"}) public Object capabilities(){return Map.of("protocolVersion",1,"status","ONLINE","onlinePlayEnabled",true,"guestSignInEnabled",false,"googleSignInEnabled",identity.configured(),"voiceEnabled",!turnUrls.isBlank()&&!turnSecret.isBlank(),"plannedMatchConfigurations",IntStream.rangeClosed(2,6).mapToObj(MatchConfiguration::forPlayers).toList());}
+ @GetMapping({"/api/v1/capabilities","/api/v1/config"}) public Object capabilities(){return Map.of("protocolVersion",1,"status","ONLINE","onlinePlayEnabled",true,"guestSignInEnabled",identity.guestConfigured(),"googleSignInEnabled",identity.configured(),"voiceEnabled",!turnUrls.isBlank()&&!turnSecret.isBlank(),"plannedMatchConfigurations",IntStream.rangeClosed(2,6).mapToObj(MatchConfiguration::forPlayers).toList());}
 }

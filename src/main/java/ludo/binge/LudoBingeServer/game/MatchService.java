@@ -34,7 +34,7 @@ public class MatchService {
   var events=db.rows("SELECT payload FROM game_events WHERE match_id=? ORDER BY seq DESC LIMIT 1",match.get("id"));result.put("lastEvent",events.isEmpty()?Map.of():db.decode(events.getFirst().get("payload"),Object.class));return result;
  }
  public Object command(UUID user,UUID match,UUID key,long revision,String action,Integer pawn){
-  return db.mutate(user,key,"match:"+match,Arrays.asList(revision,action,pawn),()->{
+  Object result=db.mutate(user,key,"match:"+match,Arrays.asList(revision,action,pawn),()->{
    var row=db.one("SELECT * FROM matches WHERE id=? FOR UPDATE",match);
    require(!db.rows("SELECT 1 FROM match_players WHERE match_id=? AND user_id=?",match,user).isEmpty(),403,"NOT_A_PLAYER");
    require(((Number)row.get("revision")).longValue()==revision,409,"STALE_MATCH_REVISION");
@@ -49,7 +49,7 @@ public class MatchService {
     if(action.equals("ROLL")){rolled=random.nextInt(6)+1;transition=engine.roll(state,rolled);}
     else {require(action.equals("MOVE")&&pawn!=null,400,"INVALID_COMMAND");transition=engine.move(state,pawn);}
    }
-   save(row,transition,rolled);
+   save(row,transition,rolled,seat,pawn);
    if(action.equals("FORFEIT")){
     db.update("DELETE FROM user_allocations WHERE user_id=? AND resource_id=?",user,row.get("room_id"));
     db.update("DELETE FROM voice_members WHERE user_id=? AND room_id=?",user,row.get("room_id"));
@@ -57,12 +57,18 @@ public class MatchService {
    }
    return view(db.one("SELECT * FROM matches WHERE id=?",match));
   });
+  // mutate has committed before returning. Deliver the exact confirmed state to
+  // both players now; the broader personalized snapshot remains recovery state.
+  if(notifier!=null)notifier.broadcastMatchUpdate(match,result);
+  return result;
  }
- private void save(Map<String,Object> row,GameEngine.Transition transition,Integer rolled){
+ private void save(Map<String,Object> row,GameEngine.Transition transition,Integer rolled,int actorSeat,Integer pawn){
+  var before=db.decode(row.get("snapshot"),GameEngine.State.class);
   var state=transition.state();UUID match=uuid(row.get("id")),room=uuid(row.get("room_id"));long revision=((Number)row.get("revision")).longValue()+1;
-  var event=new LinkedHashMap<String,Object>();event.put("effects",transition.effects());event.put("path",transition.path());event.put("dice",rolled);event.put("revision",revision);
-  db.update("UPDATE matches SET snapshot=?::jsonb,revision=?,status=?,deadline=now()+interval '45 seconds',finished_at=CASE WHEN ? THEN now() ELSE NULL END WHERE id=?",db.encode(state),revision,state.phase().equals("FINISHED")?"FINISHED":"PLAYING",state.phase().equals("FINISHED"),match);
-  db.update("INSERT INTO game_events(match_id,seq,event_id,payload) VALUES (?,?,?,?::jsonb)",match,revision,id(),db.encode(event));
+  UUID eventId=id();var event=new LinkedHashMap<String,Object>();event.put("eventId",eventId);event.put("effects",transition.effects());event.put("path",transition.path());event.put("dice",rolled);event.put("revision",revision);event.put("actorSeat",actorSeat);event.put("actorUserId",before.players().get(actorSeat).userId());event.put("turnId",before.turnId());event.put("pawn",pawn);
+  if(state.phase().equals("FINISHED"))event.put("finishReason",transition.effects().contains("TIMEOUT_FORFEIT")?"TIMEOUT_FORFEIT":transition.effects().contains("PLAYER_FORFEITED")?"PLAYER_FORFEITED":"ALL_PAWNS_HOME");
+  db.update("UPDATE matches SET snapshot=?::jsonb,revision=?,status=?,deadline=CASE WHEN ? THEN deadline ELSE now()+interval '45 seconds' END,finished_at=CASE WHEN ? THEN now() ELSE NULL END WHERE id=?",db.encode(state),revision,state.phase().equals("FINISHED")?"FINISHED":"PLAYING",actorSeat!=before.active(),state.phase().equals("FINISHED"),match);
+  db.update("INSERT INTO game_events(match_id,seq,event_id,payload) VALUES (?,?,?,?::jsonb)",match,revision,eventId,db.encode(event));
 
   if(state.phase().equals("FINISHED")){
    db.update("UPDATE rooms SET phase='FINISHED',revision=revision+1 WHERE id=?",room);db.update("DELETE FROM user_allocations WHERE resource_id=?",room);
@@ -83,7 +89,7 @@ public class MatchService {
      db.update("UPDATE rooms SET phase='PLAYING',revision=revision+1 WHERE id=?",roomId);
     }return null;
    });
-   db.tx(()->{for(var match:db.rows("SELECT * FROM matches WHERE status='PLAYING' AND deadline<=now() ORDER BY deadline LIMIT 10 FOR UPDATE SKIP LOCKED")){var state=db.decode(match.get("snapshot"),GameEngine.State.class);save(match,engine.timeout(state),null);}return null;});
+   db.tx(()->{for(var match:db.rows("SELECT * FROM matches WHERE status='PLAYING' AND deadline<=now() ORDER BY deadline LIMIT 10 FOR UPDATE SKIP LOCKED")){var state=db.decode(match.get("snapshot"),GameEngine.State.class);save(match,engine.timeout(state),null,state.active(),null);}return null;});
   }catch(org.springframework.dao.DataAccessException e){org.slf4j.LoggerFactory.getLogger(getClass()).warn("Match worker could not access database: {}",e.getClass().getSimpleName());}
  }
 }

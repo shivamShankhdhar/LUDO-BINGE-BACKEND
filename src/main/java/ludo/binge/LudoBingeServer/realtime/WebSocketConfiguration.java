@@ -38,6 +38,15 @@ public class WebSocketConfiguration implements WebSocketConfigurer {
                         attributes.put("actor", actor);
                         return true;
                     }
+                    String authHeader = request.getHeaders().getFirst("Authorization");
+                    if (authHeader != null && authHeader.startsWith("Bearer ")) {
+                        try {
+                            String token = authHeader.substring(7);
+                            Actor actor = identity.authenticate(token);
+                            attributes.put("actor", actor);
+                            return true;
+                        } catch (Exception ignored) {}
+                    }
                     return false;
                 }
 
